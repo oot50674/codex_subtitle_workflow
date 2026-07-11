@@ -21,7 +21,7 @@
 - PowerShell Core (`pwsh`)
 - FFmpeg와 FFprobe
 
-FFmpeg는 고정 경로를 가정하지 않습니다. 다음 순서로 찾습니다.
+FFmpeg는 다음 순서로 찾습니다.
 
 1. 명시한 `--ffmpeg-root`
 2. `SUBFLOW_FFMPEG_ROOT` 또는 `FFMPEG_ROOT`

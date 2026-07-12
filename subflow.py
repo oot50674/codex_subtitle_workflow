@@ -565,10 +565,24 @@ def cue_flags(cue: Cue, previous: Cue | None) -> list[str]:
     return flags
 
 
-def split_lines(text: str, max_chars: int) -> str:
-    """Balance wrapped lines without collapsing internal whitespace."""
+def split_lines(text: str, max_chars: int, max_lines: int | None = None) -> str:
+    """Balance wrapped lines, optionally enforcing a hard line-count limit."""
     if not text.strip() or max_chars <= 0:
         return text.strip()
+    if max_lines is not None:
+        if max_lines <= 0:
+            raise WorkflowError("max_lines must be positive")
+        compact = re.sub(r"\s+", " ", text).strip()
+        if len(compact) <= max_chars or max_lines == 1:
+            return compact
+        if max_lines == 2:
+            midpoint = len(compact) / 2
+            candidates = [match.start() for match in re.finditer(r"\s", compact)]
+            if not candidates:
+                boundary = round(midpoint)
+                return f"{compact[:boundary]}\n{compact[boundary:]}"
+            boundary = min(candidates, key=lambda value: abs(value - midpoint))
+            return f"{compact[:boundary].rstrip()}\n{compact[boundary:].lstrip()}"
     output: list[str] = []
     for paragraph in text.splitlines():
         if not paragraph:
@@ -1550,8 +1564,8 @@ def command_apply(args: argparse.Namespace) -> int:
         end_ms = int(timing.get("end_ms", cue.end_ms))
         if start_ms < 0 or end_ms <= start_ms:
             raise WorkflowError(f"Cue {cue.index} has invalid timing: {start_ms}..{end_ms}")
-        corrected_text = split_lines(corrected_text, args.source_line_chars)
-        translation = split_lines(translation, args.target_line_chars)
+        corrected_text = split_lines(corrected_text, args.source_line_chars, max_lines=2)
+        translation = split_lines(translation, args.target_line_chars, max_lines=2)
         corrected_cue = replace(cue, start_ms=start_ms, end_ms=end_ms, text=corrected_text)
         translated_cue = replace(cue, start_ms=start_ms, end_ms=end_ms, text=translation)
         corrected.append(corrected_cue)

@@ -117,12 +117,12 @@ the new conclusion is stable beyond this one cue.
    order. Keep each cue understandable with its immediate neighbors.
 5. Keep Blender shortcuts as explicit key sequences (`Ctrl+R`, `G` twice,
    `M → A`, `M → L`, `K`, `E`, `F`).
-6. Keep each translated cue to one or two lines whenever possible. Use roughly
-   24 Korean characters per line as the default guide. If a cue would exceed
-   two lines, first shorten or rephrase it without dropping meaning. Split the
-   cue only when the speech timing and surrounding context support a clean
-   split. Use three or more lines only as an unavoidable exception and explain
-   the reason in `notes`.
+6. Keep each translated cue to one or two lines whenever possible. Break lines
+   at natural semantic or syntactic boundaries, not by a fixed character
+   count. If a cue would exceed two lines, first shorten or rephrase it without
+   dropping meaning. Split the cue only when the speech timing and surrounding
+   context support a clean split. Use three or more lines only as an
+   unavoidable exception and explain the reason in `notes`.
 7. Use the same Korean term throughout a video. For this sample:
 
    - mesh → 메시

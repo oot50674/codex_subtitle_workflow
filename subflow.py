@@ -36,6 +36,7 @@ DEFAULT_FFMPEG_INSTALL_ROOT = (
 )
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_WHISPER_RUNTIME_ROOT = PROJECT_ROOT / ".runtime" / "whisper"
+DEFAULT_YOUTUBE_RUNTIME_ROOT = PROJECT_ROOT / ".runtime" / "youtube"
 DEFAULT_WHISPER_MODEL_ROOT = Path(
     os.environ.get(
         "SUBFLOW_WHISPER_MODEL_ROOT",
@@ -44,6 +45,7 @@ DEFAULT_WHISPER_MODEL_ROOT = Path(
 )
 WHISPER_WORKER = PROJECT_ROOT / "whisper_runtime" / "worker.py"
 WHISPER_REQUIREMENTS = PROJECT_ROOT / "whisper_runtime" / "requirements.txt"
+YOUTUBE_REQUIREMENTS = PROJECT_ROOT / "youtube_runtime" / "requirements.txt"
 TIME_RE = re.compile(
     r"^(?P<sh>\d{2}):(?P<sm>\d{2}):(?P<ss>\d{2})[,.](?P<sms>\d{3})\s*-->\s*"
     r"(?P<eh>\d{2}):(?P<em>\d{2}):(?P<es>\d{2})[,.](?P<ems>\d{3})"
@@ -245,6 +247,49 @@ def install_whisper_runtime(runtime_root: Path, *, upgrade: bool = False) -> Pat
     command.extend(["-r", str(WHISPER_REQUIREMENTS)])
     run(command)
     return python
+
+
+def youtube_runtime_python(
+    runtime_root: Path = DEFAULT_YOUTUBE_RUNTIME_ROOT,
+    explicit: Path | None = None,
+) -> Path:
+    if explicit is not None:
+        return explicit.expanduser().resolve()
+    environment = os.environ.get("SUBFLOW_YOUTUBE_PYTHON")
+    if environment:
+        return Path(environment).expanduser().resolve()
+    runtime_root = runtime_root.expanduser().resolve()
+    if os.name == "nt":
+        return runtime_root / "venv" / "Scripts" / "python.exe"
+    return runtime_root / "venv" / "bin" / "python"
+
+
+def install_youtube_runtime(runtime_root: Path, *, upgrade: bool = False) -> Path:
+    runtime_root = runtime_root.expanduser().resolve()
+    if not YOUTUBE_REQUIREMENTS.is_file():
+        raise WorkflowError("YouTube runtime requirements are missing from the project")
+    python = youtube_runtime_python(runtime_root)
+    if not python.is_file():
+        runtime_root.mkdir(parents=True, exist_ok=True)
+        run([sys.executable, "-m", "venv", str(runtime_root / "venv")])
+    command = [
+        str(python), "-X", "utf8", "-m", "pip", "install",
+        "--disable-pip-version-check",
+    ]
+    if upgrade:
+        command.append("--upgrade")
+    command.extend(["-r", str(YOUTUBE_REQUIREMENTS)])
+    run(command)
+    return python
+
+
+def validate_youtube_url(value: str) -> str:
+    parsed = urllib.parse.urlparse(str(value).strip())
+    host = (parsed.hostname or "").lower().rstrip(".")
+    allowed = host == "youtu.be" or host == "youtube.com" or host.endswith(".youtube.com")
+    if parsed.scheme != "https" or not allowed:
+        raise WorkflowError("Expected an HTTPS youtube.com or youtu.be URL")
+    return parsed.geturl()
 
 
 def manifest_id_for(
@@ -631,6 +676,75 @@ def command_whisper_doctor(args: argparse.Namespace) -> int:
     if completed.stderr:
         print(completed.stderr.rstrip(), file=sys.stderr)
     return 0 if completed.returncode == 0 else 2
+
+
+def command_youtube_doctor(args: argparse.Namespace) -> int:
+    runtime_root = args.runtime_root.expanduser().resolve()
+    if args.upgrade_runtime and not args.install_runtime:
+        raise WorkflowError("--upgrade-runtime requires --install-runtime")
+    if args.install_runtime:
+        if args.runtime_python is not None:
+            raise WorkflowError("--install-runtime cannot be combined with --runtime-python")
+        python = install_youtube_runtime(runtime_root, upgrade=args.upgrade_runtime)
+    else:
+        python = youtube_runtime_python(runtime_root, args.runtime_python)
+    if not python.is_file():
+        report = {
+            "ok": False,
+            "runtime_root": str(runtime_root),
+            "python": str(python),
+            "error": "YouTube download runtime is not installed",
+            "hint": "Run 'python subflow.py youtube-doctor --install-runtime'",
+        }
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 2
+    completed = run([str(python), "-X", "utf8", "-m", "yt_dlp", "--version"], capture=True)
+    report = {
+        "ok": True,
+        "runtime_root": str(runtime_root),
+        "python": str(python),
+        "yt_dlp": completed.stdout.strip(),
+    }
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0
+
+
+def command_download_youtube(args: argparse.Namespace) -> int:
+    url = validate_youtube_url(args.url)
+    runtime_root = args.runtime_root.expanduser().resolve()
+    python = youtube_runtime_python(runtime_root, args.runtime_python)
+    if not python.is_file():
+        raise WorkflowError(
+            f"YouTube download runtime is not installed: {python}. "
+            "Run 'python subflow.py youtube-doctor --install-runtime'."
+        )
+    output_dir = args.output_dir.expanduser().resolve()
+    if output_dir.exists() and not output_dir.is_dir():
+        raise WorkflowError(f"Output path is not a directory: {output_dir}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ffmpeg, _ = tool_paths(args.ffmpeg_root)
+    command = [
+        str(python), "-X", "utf8", "-m", "yt_dlp",
+        "--ffmpeg-location", str(ffmpeg.parent),
+        "--no-write-subs",
+        "--no-write-auto-subs",
+        "--paths", str(output_dir),
+        "--output", args.output_template,
+        "--print", "after_move:filepath",
+    ]
+    if not args.playlist:
+        command.append("--no-playlist")
+    if args.audio_only:
+        command.extend(["--extract-audio", "--audio-format", args.audio_format])
+    else:
+        command.extend(["--format", args.format, "--merge-output-format", args.container])
+    if args.force:
+        command.append("--force-overwrites")
+    command.append(url)
+    completed = run(command, capture=True)
+    paths = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+    print(json.dumps({"ok": True, "url": url, "files": paths}, ensure_ascii=False, indent=2))
+    return 0
 
 
 def _transcription_metadata_path(output: Path, explicit: Path | None) -> Path:
@@ -1510,6 +1624,26 @@ def inspect_output(
             if mode == "target" and target_language == "ko" and not re.search(r"[가-힣]", cue.text):
                 errors.append({"index": cue.index, "code": "no_hangul"})
         previous = cue
+
+    run_start = 0
+    while run_start < len(cues):
+        normalized = re.sub(r"\s+", " ", cues[run_start].text).strip().casefold()
+        run_end = run_start + 1
+        while run_end < len(cues):
+            candidate = re.sub(r"\s+", " ", cues[run_end].text).strip().casefold()
+            if candidate != normalized:
+                break
+            run_end += 1
+        repeated = cues[run_start:run_end]
+        if len(repeated) >= 3 and any(cue.duration_ms < 500 for cue in repeated):
+            errors.append({
+                "index": repeated[0].index,
+                "end_index": repeated[-1].index,
+                "code": "suspicious_repeated_micro_cues",
+                "count": len(repeated),
+                "minimum_duration_ms": min(cue.duration_ms for cue in repeated),
+            })
+        run_start = run_end
     return {"cue_count": len(cues), "errors": errors, "warnings": warnings}
 
 
@@ -1832,6 +1966,34 @@ def build_parser() -> argparse.ArgumentParser:
     whisper_doctor.add_argument("--install-runtime", action="store_true")
     whisper_doctor.add_argument("--upgrade-runtime", action="store_true")
     whisper_doctor.set_defaults(func=command_whisper_doctor)
+
+    youtube_doctor = sub.add_parser(
+        "youtube-doctor",
+        help="check or install the project-local yt-dlp runtime",
+    )
+    youtube_doctor.add_argument("--runtime-root", type=Path, default=DEFAULT_YOUTUBE_RUNTIME_ROOT)
+    youtube_doctor.add_argument("--runtime-python", type=Path)
+    youtube_doctor.add_argument("--install-runtime", action="store_true")
+    youtube_doctor.add_argument("--upgrade-runtime", action="store_true")
+    youtube_doctor.set_defaults(func=command_youtube_doctor)
+
+    download_youtube = sub.add_parser(
+        "download-youtube",
+        help="download YouTube media only; all YouTube subtitles are forcibly disabled",
+    )
+    download_youtube.add_argument("url")
+    download_youtube.add_argument("--output-dir", type=Path, default=Path.cwd())
+    download_youtube.add_argument("--runtime-root", type=Path, default=DEFAULT_YOUTUBE_RUNTIME_ROOT)
+    download_youtube.add_argument("--runtime-python", type=Path)
+    download_youtube.add_argument("--ffmpeg-root", type=Path)
+    download_youtube.add_argument("--output-template", default="%(title)s [%(id)s].%(ext)s")
+    download_youtube.add_argument("--format", default="bv*+ba/b")
+    download_youtube.add_argument("--container", default="mp4", choices=("mp4", "mkv", "webm"))
+    download_youtube.add_argument("--audio-only", action="store_true")
+    download_youtube.add_argument("--audio-format", default="mp3", choices=("mp3", "m4a", "opus", "wav", "flac"))
+    download_youtube.add_argument("--playlist", action="store_true", help="allow downloading every item in a playlist URL")
+    download_youtube.add_argument("--force", action="store_true", help="overwrite existing downloaded files")
+    download_youtube.set_defaults(func=command_download_youtube)
 
     transcribe = sub.add_parser(
         "transcribe",

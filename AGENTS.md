@@ -10,6 +10,19 @@
   `.runtime/whisper`.
 - If FFmpeg is missing, use `subflow.py doctor --install-ffmpeg` only with the
   user's authorization for the download and local installation.
+- Before downloading a YouTube video, run `subflow.py youtube-doctor`. Use
+  `--install-runtime` only with the user's authorization for dependency
+  downloads. The isolated yt-dlp environment lives under `.runtime/youtube`.
+- Use `subflow.py download-youtube` for YouTube URLs. It downloads one video by
+  default even when the URL contains a playlist; use `--playlist` only when the
+  user explicitly requests the full playlist.
+- Never download or use YouTube subtitles or automatic captions as a
+  transcription source. `download-youtube` is media-only. When a trusted SRT
+  was not supplied by the user, transcribe the full media with
+  `large-v3-turbo` before translation.
+- Never invoke the project-local `yt-dlp` module directly. All YouTube
+  downloads must go through `subflow.py download-youtube`, which forcibly
+  disables manual and automatic subtitle downloads.
 - Keep media operations deterministic in the CLI. The agent owns semantic
   correction, translation, timing judgment, and evidence notes.
 - Use `subflow.py transcribe` for a missing full draft or an exact time range.

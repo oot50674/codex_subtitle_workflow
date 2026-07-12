@@ -18,6 +18,10 @@ media, bookkeeping, and rendering layer.
 
 ## Whisper-assisted transcription
 
+0. YouTube subtitles and automatic captions are prohibited as transcription
+   sources. If the user did not provide a trusted source SRT, run a full-media
+   `large-v3-turbo` transcription. Do not substitute downloaded captions for
+   Whisper to save time.
 1. Run `subflow.py whisper-doctor` before invoking Whisper. Install the
    project-local runtime or download a missing model only with user approval.
 2. When no draft SRT exists, use `transcribe` on the full media. When checking
@@ -136,9 +140,14 @@ the new conclusion is stable beyond this one cue.
 8. Record a short `notes` explanation for non-obvious source or timing changes.
 9. Use `confidence: high|medium|low`. Low-confidence decisions must retain the
    original timing and be listed for a final human check.
+10. Treat three or more consecutive identical cues as a mandatory ASR
+    hallucination check when any cue is shorter than 500 ms. Check the audio
+    through the final cue instead of accepting reading-speed warnings alone.
 
 ## Required completion checks
 
+- The source provenance is either a user-supplied trusted SRT or a retained
+  `large-v3-turbo` transcription record. YouTube captions are not accepted.
 - Exactly one decision for every manifest cue.
 - `source` matches the manifest text.
 - No empty `corrected` or `translation` fields.
@@ -146,6 +155,8 @@ the new conclusion is stable beyond this one cue.
   explicit reason in `notes`.
 - Every correction candidate has been checked against nearby context and, when
   useful, a frame or evidence packet.
+- Repeated micro-cue runs and sub-150 ms cues near the end of the media have
+  been checked against audio; unexplained repetitions are not publishable.
 - `apply` succeeds without `--allow-missing`.
 - `verify` reports zero errors. Reading-speed warnings are review prompts, not
   automatic failures.

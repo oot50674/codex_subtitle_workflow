@@ -164,3 +164,32 @@ $OutputRoot = 'D:\subtitle-output'
 
 한국어 자막은 가능하면 한 cue당 1~2줄로 압축하고, 실제 음성·화면 근거가
 있을 때만 타이밍을 변경합니다.
+
+## YouTube 영상 다운로드
+
+YouTube URL에서 영상을 내려받을 때는 프로젝트 내부의 전용 `yt-dlp`
+환경을 사용합니다. 런타임은 `.runtime\youtube`에 설치되며 Git에는
+포함되지 않습니다. 최초 한 번만 다음 명령을 실행합니다.
+
+이 명령은 영상·오디오만 다운로드하며 YouTube 제공 자막과 자동자막은
+항상 제외합니다. 사용자가 신뢰 가능한 SRT를 제공하지 않았다면
+`large-v3-turbo`로 영상 전체를 전사해야 합니다.
+프로젝트의 `yt-dlp` 모듈을 직접 호출하는 방식은 워크플로우에서
+금지하며 모든 다운로드는 아래 CLI를 통해서만 수행합니다.
+
+```powershell
+python -X utf8 .\subflow.py youtube-doctor --install-runtime
+```
+
+단일 영상을 MP4로 내려받는 기본 예시입니다. 재생목록이 포함된 URL도
+기본적으로 해당 영상 하나만 받습니다.
+
+```powershell
+python -X utf8 .\subflow.py download-youtube `
+  "https://www.youtube.com/watch?v=VIDEO_ID" `
+  --output-dir "D:\media\downloads"
+```
+
+재생목록 전체를 받을 때만 `--playlist`를 명시합니다. 오디오만 필요하면
+`--audio-only --audio-format mp3`를 사용합니다. 기존 파일은 기본적으로
+보존하며, 의도적으로 덮어쓸 때만 `--force`를 지정합니다.

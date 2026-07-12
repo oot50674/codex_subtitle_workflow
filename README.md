@@ -39,10 +39,10 @@ SHA-256을 검증하고 `%LOCALAPPDATA%\SubtitleWorkflow\ffmpeg`에 설치합니
 python -X utf8 .\subflow.py doctor --install-ffmpeg
 ```
 
-## 프로젝트 내장 Whisper 전사
+## Whisper 전사
 
-Whisper-WebUI 서버를 별도로 실행하지 않습니다. `subflow.py`가 프로젝트
-내부의 전용 Python 환경에서 `faster-whisper` worker를 직접 호출합니다.
+Whisper 전사는 프로젝트 내부의 전용 Python 환경과 `faster-whisper`
+worker를 사용합니다.
 
 - 가상환경: `.runtime\whisper\venv`
 - 모델 캐시: `.runtime\whisper\models`

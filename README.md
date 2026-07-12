@@ -12,9 +12,6 @@
 - `AGENT_PROTOCOL.md`: 전체 검토·번역·검증 프로토콜
 - `doc/`: 빈 인덱스, 작업 기록 템플릿, 향후 축적할 지식 문서 구조
 
-배포본에는 이전 영상, 자막, 작업 폴더, 발행 결과와 과거 작업 문서가
-포함되지 않습니다.
-
 ## 요구 사항
 
 - Windows 10 이상
@@ -23,7 +20,7 @@
 - FFmpeg와 FFprobe
 - NVIDIA GPU 사용 시 호환되는 CUDA/cuDNN 런타임
 
-FFmpeg는 고정 경로를 가정하지 않습니다. 다음 순서로 찾습니다.
+FFmpeg는 다음 순서로 찾습니다.
 
 1. 명시한 `--ffmpeg-root`
 2. `SUBFLOW_FFMPEG_ROOT` 또는 `FFMPEG_ROOT`

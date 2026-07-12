@@ -1,195 +1,170 @@
 # Subtitle Workflow
 
-영상과 초벌 SRT를 근거로 오탈자·싱크를 검토하고 한국어 번역 자막을
-생성하는 agent-in-the-loop CLI입니다. 미디어 처리와 검증은 CLI가 맡고,
-의미 교정·번역·타이밍 판단은 에이전트가 증거를 보고 결정합니다.
+영상의 음성을 확인해 초벌 자막을 교정하고 한국어 번역 자막을 만드는
+에이전트 기반 작업 도구입니다.
 
-## 구성
+사용자는 영상이나 YouTube 주소, 그리고 가지고 있는 SRT를 제공하면 됩니다.
+에이전트가 전사, 증거 확인, 교정, 번역, 검증을 순서대로 진행하고 최종 SRT를
+정리합니다. 사용자가 내부 로직이나 개별 명령을 모두 알 필요는 없습니다.
 
-- `subflow.py`: 메인 CLI
-- `whisper_runtime/`: 격리된 faster-whisper worker와 고정 의존성
-- `AGENTS.md`: 에이전트가 먼저 읽는 진입 지침
-- `AGENT_PROTOCOL.md`: 전체 검토·번역·검증 프로토콜
-- `doc/`: 빈 인덱스, 작업 기록 템플릿, 향후 축적할 지식 문서 구조
+## 한눈에 보는 작업 흐름
 
-## 요구 사항
+```text
+영상 또는 YouTube 주소 준비
+  ↓
+신뢰할 수 있는 초벌 SRT 확인
+  ├─ SRT가 있으면 사용
+  └─ 없으면 Whisper로 영상 전체 전사
+  ↓
+에이전트가 음성·화면·앞뒤 문맥을 확인
+  ↓
+원문 교정 및 한국어 번역
+  ↓
+누락·싱크·길이·반복 오류 자동 검증
+  ↓
+검증된 한국어 SRT 발행
+```
 
-- Windows 10 이상
-- Python 3.10 이상
-- PowerShell Core (`pwsh`)
-- FFmpeg와 FFprobe
-- NVIDIA GPU 사용 시 호환되는 CUDA/cuDNN 런타임
+## 사용자가 준비할 것
 
-FFmpeg는 다음 순서로 찾습니다.
+다음 중 가능한 자료를 에이전트에게 알려주면 됩니다.
 
-1. 명시한 `--ffmpeg-root`
-2. `SUBFLOW_FFMPEG_ROOT` 또는 `FFMPEG_ROOT`
-3. 프로세스 `PATH`의 `ffmpeg`와 `ffprobe`
-4. 이 도구가 설치한 사용자 로컬 FFmpeg
+- 로컬 영상 파일 경로 또는 YouTube URL
+- 직접 만들었거나 신뢰할 수 있는 원문 SRT
+- 원문 언어와 번역할 언어
+- 고유명사, 선호 용어, 말투처럼 반드시 지켜야 할 사항
+- 결과 자막을 저장할 위치에 대한 별도 요구
+
+신뢰할 수 있는 SRT가 없다면 에이전트가 `large-v3-turbo` 모델로 영상 전체를
+전사합니다. YouTube가 제공하는 자막과 자동자막은 전사 원본으로 사용하지
+않습니다.
+
+## 처음 사용할 때
+
+Windows 10 이상, Python 3.10 이상, PowerShell Core(`pwsh`)가 필요합니다.
+영상 처리를 위해 FFmpeg와 FFprobe도 사용합니다.
+
+에이전트는 작업을 시작하기 전에 다음 상태를 확인합니다.
+
+1. FFmpeg를 사용할 수 있는지 확인
+2. 전사가 필요하면 전용 Whisper 환경 확인
+3. YouTube 영상이 필요하면 전용 다운로드 환경 확인
+
+필요한 프로그램이나 모델을 새로 내려받아야 할 때는 먼저 사용자에게 승인을
+받습니다. 설치된 전용 환경과 모델은 프로젝트의 `.runtime` 폴더에 보관되며
+Git에는 포함되지 않습니다.
+
+## 에이전트가 하는 일
+
+### 1. 입력 자료 준비
+
+YouTube URL을 받으면 영상과 오디오만 내려받습니다. URL에 재생목록 정보가
+포함되어 있어도 기본적으로 해당 영상 하나만 받습니다. 사용자가 재생목록
+전체를 요청한 경우에만 전체를 내려받습니다.
+
+신뢰할 수 있는 SRT가 없으면 내려받은 영상이나 로컬 영상 전체를 Whisper로
+전사합니다.
+
+### 2. 작업 폴더 생성
+
+영상마다 새로운 작업 폴더를 만들고 영상 정보, 자막 내용, 자막별 시작·종료
+시각을 정리합니다. 기존 작업과 관련이 있다면 `doc/index.json`에서 이전 작업
+기록과 용어를 확인합니다.
+
+### 3. 증거 확인
+
+에이전트는 자막 문장만 보고 번역하지 않습니다. 필요한 구간의 음성, 영상
+프레임, 짧은 영상 클립, 앞뒤 자막, Whisper 재전사 결과를 함께 확인합니다.
+
+싱크 분석 결과는 참고 자료일 뿐 자동으로 타이밍을 바꾸는 기준은 아닙니다.
+실제 음성과 화면에서 근거를 찾았을 때만 원문이나 타이밍을 수정합니다.
+
+### 4. 교정과 번역
+
+에이전트가 다음 작업을 수행합니다.
+
+- 잘못 전사된 원문 교정
+- 문맥과 말투를 살린 한국어 번역
+- 영상 전체의 용어와 고유명사 통일
+- 읽기 어려운 문장 축약
+- 필요한 경우에만 자막 타이밍 조정
+- 확신이 낮은 부분을 최종 확인 대상으로 표시
+
+한국어 자막은 가능하면 한 자막 구간당 한두 줄로 만듭니다. 자연스럽게 보이게 하려는
+이유만으로 원문의 의미나 타이밍을 임의로 바꾸지 않습니다.
+
+### 5. 자동 검증
+
+번역이 끝나면 다음 문제를 검사합니다.
+
+- 빠졌거나 비어 있는 자막
+- 잘못된 자막 순서와 시간 범위
+- 지나치게 길거나 빠르게 지나가는 자막
+- 한국어 번역이 들어가지 않은 항목
+- 짧은 동일 문장이 반복되는 등 전사 오류가 의심되는 구간
+
+오류가 발견되면 해당 구간의 음성과 화면을 다시 확인합니다. 모든 필수 검사를
+통과한 결과만 발행합니다.
+
+### 6. 결과 발행과 기록
+
+최종 결과는 다음 구조로 정리됩니다.
+
+```text
+output\YYYY-MM-DD\HHmmss
+```
+
+기본적으로 원본 영상 옆에도 번역 자막을 저장합니다.
+
+```text
+video.mp4
+video.ko.srt
+```
+
+작업에 사용한 입력, 판단 결과, 출력 파일 경로와 해시는 `run.json`과 `doc/`
+기록에 남깁니다. 따라서 나중에 어떤 영상과 자막으로 만든 결과인지 확인할 수
+있습니다.
+
+## 에이전트에게 요청하는 예시
+
+```text
+D:\media\tutorial.mp4를 한국어 자막으로 만들어줘.
+원문 SRT는 없으니 영상 전체를 전사해서 진행해줘.
+```
+
+```text
+이 YouTube 영상을 한국어로 번역해줘:
+https://www.youtube.com/watch?v=VIDEO_ID
+```
+
+```text
+D:\media\video.mp4와 D:\media\draft.en.srt를 사용해서
+오역과 싱크를 검토하고 한국어 SRT를 만들어줘.
+```
+
+이후 에이전트가 필요한 검사와 작업을 순서대로 수행합니다. 다운로드나 런타임
+설치처럼 외부 파일을 받아야 하는 단계에서만 사용자 승인을 요청합니다.
+
+## 직접 실행할 때 참고할 명령
+
+일반적으로는 에이전트가 실행하므로 아래 명령을 외울 필요가 없습니다.
 
 ```powershell
+# FFmpeg 상태 확인
 python -X utf8 .\subflow.py doctor
-```
 
-찾지 못했을 때만 다음 명령으로 Gyan의 Windows Essentials ZIP을 내려받아
-SHA-256을 검증하고 `%LOCALAPPDATA%\SubtitleWorkflow\ffmpeg`에 설치합니다.
-설치된 `bin` 폴더는 현재 프로세스와 사용자 `PATH`에 추가됩니다.
-
-```powershell
-python -X utf8 .\subflow.py doctor --install-ffmpeg
-```
-
-## Whisper 전사
-
-Whisper 전사는 프로젝트 내부의 전용 Python 환경과 `faster-whisper`
-worker를 사용합니다.
-
-- 가상환경: `.runtime\whisper\venv`
-- 모델 캐시: `.runtime\whisper\models`
-- 두 경로 모두 Git에서 제외
-
-최초 한 번, 사용자의 다운로드 승인을 받은 뒤 전용 환경을 설치합니다.
-
-```powershell
-python -X utf8 .\subflow.py whisper-doctor --install-runtime
-```
-
-설치 이후 상태와 캐시된 모델을 확인할 때는 다운로드 없이 실행합니다.
-
-```powershell
+# Whisper 환경 확인
 python -X utf8 .\subflow.py whisper-doctor
-```
 
-전체 영상을 영어로 전사하는 예시입니다. 모델이 캐시에 없으면 최초 실행
-중 웹에서 `.runtime\whisper\models\<모델명>`으로 자동 다운로드합니다.
-`large-v3-turbo`의 주 모델 파일은
-`.runtime\whisper\models\large-v3-turbo\model.bin`에 저장됩니다.
+# 최초 Whisper 환경 설치: 다운로드 승인 후 실행
+python -X utf8 .\subflow.py whisper-doctor --install-runtime
 
-```powershell
-python -X utf8 .\subflow.py transcribe "D:\media\video.mp4" `
-  --model large-v3-turbo `
-  --language en `
-  --output ".\work\video-01\draft.en.srt"
-```
+# YouTube 환경 확인
+python -X utf8 .\subflow.py youtube-doctor
 
-특정 시간 범위만 재전사하면 결과 SRT의 타임코드는 원본 영상 기준으로
-복원됩니다. `--keep-audio`를 지정하면 실제로 Whisper에 전달한 16 kHz
-모노 WAV도 증거로 보존합니다.
-
-```powershell
-python -X utf8 .\subflow.py transcribe "D:\media\video.mp4" `
-  --start 00:12:30.000 `
-  --end 00:13:10.000 `
-  --model large-v3-turbo `
-  --language en `
-  --keep-audio `
-  --output ".\work\video-01\check-1230.en.srt"
-```
-
-이미 manifest가 있으면 인접 cue 범위를 패딩과 함께 바로 재전사할 수
-있습니다. 멀리 떨어진 cue는 한 번에 묶지 말고 별도 호출합니다.
-
-```powershell
-python -X utf8 .\subflow.py transcribe-cues `
-  --manifest ".\work\video-01\manifest.json" `
-  --cues "8-12" `
-  --padding 1.25 `
-  --model large-v3-turbo `
-  --language en `
-  --output ".\work\video-01\evidence\cues-0008-0012.en.srt"
-```
-
-모든 전사는 SRT 옆에 `*.transcription.json`을 생성합니다. 이 파일에는
-소스 해시, 원본 기준 구간, 모델·장치·언어, 실행 옵션, 절대 타임코드와
-세그먼트 신뢰도 정보가 기록됩니다. 모델 다운로드를 금지하고 캐시만
-검사하려면 `--local-files-only`를 사용합니다.
-
-## 기본 작업 흐름
-
-```powershell
-$Python = 'python'
-$Tool = Join-Path $PWD 'subflow.py'
-$Video = 'D:\media\video.mp4'
-$Draft = 'D:\media\draft.srt'
-$Work = 'D:\subtitle-jobs\video-01'
-$OutputRoot = 'D:\subtitle-output'
-
-& $Python -X utf8 $Tool prepare $Video $Draft `
-  --workdir $Work `
-  --source-language en `
-  --target-language ko
-
-& $Python -X utf8 $Tool sync `
-  --manifest "$Work\manifest.json" `
-  --output "$Work\sync_analysis.json"
-
-& $Python -X utf8 $Tool evidence `
-  --manifest "$Work\manifest.json" `
-  --cues '3,8-12,42' `
-  --output "$Work\evidence"
-```
-
-에이전트는 `AGENT_PROTOCOL.md`에 따라 증거를 검토하고 번역 맵과 확정
-교정 파일을 작성합니다. 이후 다음과 같이 병합·적용·검증·발행합니다.
-
-```powershell
-& $Python -X utf8 $Tool merge `
-  --manifest "$Work\manifest.json" `
-  --translation-map "$Work\translations.json" `
-  --overrides "$Work\overrides.json" `
-  --source-preserving `
-  --output "$Work\decisions.json"
-
-& $Python -X utf8 $Tool apply `
-  --manifest "$Work\manifest.json" `
-  --decisions "$Work\decisions.json" `
-  --output "$Work\applied"
-
-& $Python -X utf8 $Tool verify `
-  --manifest "$Work\manifest.json" `
-  --output "$Work\applied"
-
-& $Python -X utf8 $Tool publish `
-  --manifest "$Work\manifest.json" `
-  --decisions "$Work\decisions.json" `
-  --source-output "$Work\applied" `
-  --output-root $OutputRoot
-```
-
-발행 결과는 `output\YYYY-MM-DD\HHmmss` 구조로 정리됩니다. 동시에 번역
-자막을 원본 영상 폴더에 `<영상 이름>.<대상 언어>.srt`로 저장합니다. 예를
-들어 대상 언어가 한국어면 `video.ko.srt`가 생성되며, 경로와 SHA-256은
-`run.json`에 기록됩니다. 원본 옆 저장을 원하지 않을 때만 publish에
-`--no-source-sidecar`를 지정합니다.
-
-한국어 자막은 가능하면 한 cue당 1~2줄로 압축하고, 실제 음성·화면 근거가
-있을 때만 타이밍을 변경합니다.
-
-## YouTube 영상 다운로드
-
-YouTube URL에서 영상을 내려받을 때는 프로젝트 내부의 전용 `yt-dlp`
-환경을 사용합니다. 런타임은 `.runtime\youtube`에 설치되며 Git에는
-포함되지 않습니다. 최초 한 번만 다음 명령을 실행합니다.
-
-이 명령은 영상·오디오만 다운로드하며 YouTube 제공 자막과 자동자막은
-항상 제외합니다. 사용자가 신뢰 가능한 SRT를 제공하지 않았다면
-`large-v3-turbo`로 영상 전체를 전사해야 합니다.
-프로젝트의 `yt-dlp` 모듈을 직접 호출하는 방식은 워크플로우에서
-금지하며 모든 다운로드는 아래 CLI를 통해서만 수행합니다.
-
-```powershell
+# 최초 YouTube 환경 설치: 다운로드 승인 후 실행
 python -X utf8 .\subflow.py youtube-doctor --install-runtime
 ```
 
-단일 영상을 MP4로 내려받는 기본 예시입니다. 재생목록이 포함된 URL도
-기본적으로 해당 영상 하나만 받습니다.
-
-```powershell
-python -X utf8 .\subflow.py download-youtube `
-  "https://www.youtube.com/watch?v=VIDEO_ID" `
-  --output-dir "D:\media\downloads"
-```
-
-재생목록 전체를 받을 때만 `--playlist`를 명시합니다. 오디오만 필요하면
-`--audio-only --audio-format mp3`를 사용합니다. 기존 파일은 기본적으로
-보존하며, 의도적으로 덮어쓸 때만 `--force`를 지정합니다.
+세부 검토·번역 규칙은 `AGENT_PROTOCOL.md`, 에이전트 진입 지침은
+`AGENTS.md`에 있습니다.

@@ -34,10 +34,24 @@ DEFAULT_FFMPEG_INSTALL_ROOT = (
     Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
     / "SubtitleWorkflow" / "ffmpeg"
 )
+PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_WHISPER_RUNTIME_ROOT = PROJECT_ROOT / ".runtime" / "whisper"
+DEFAULT_WHISPER_MODEL_ROOT = Path(
+    os.environ.get(
+        "SUBFLOW_WHISPER_MODEL_ROOT",
+        DEFAULT_WHISPER_RUNTIME_ROOT / "models",
+    )
+)
+WHISPER_WORKER = PROJECT_ROOT / "whisper_runtime" / "worker.py"
+WHISPER_REQUIREMENTS = PROJECT_ROOT / "whisper_runtime" / "requirements.txt"
 TIME_RE = re.compile(
     r"^(?P<sh>\d{2}):(?P<sm>\d{2}):(?P<ss>\d{2})[,.](?P<sms>\d{3})\s*-->\s*"
     r"(?P<eh>\d{2}):(?P<em>\d{2}):(?P<es>\d{2})[,.](?P<ems>\d{3})"
     r"(?P<settings>.*)$"
+)
+TIME_POINT_RE = re.compile(
+    r"^(?:(?P<hours>\d+):)?(?P<minutes>\d{1,2}):(?P<seconds>\d{1,2})"
+    r"(?:[,.](?P<millis>\d{1,3}))?$"
 )
 
 
@@ -131,12 +145,106 @@ def write_srt(path: Path, cues: Iterable[Cue]) -> None:
     path.write_text("\n".join(chunks), encoding="utf-8-sig", newline="\n")
 
 
+def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path = path.expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def subtitle_sidecar_path(media: Path, language: str) -> Path:
+    language = str(language).strip()
+    if not re.fullmatch(r"[A-Za-z0-9-]+", language):
+        raise WorkflowError(f"Unsafe subtitle language suffix: {language!r}")
+    media = media.expanduser().resolve()
+    return media.with_name(f"{media.stem}.{language}.srt")
+
+
+def copy_file_atomic(source: Path, destination: Path) -> None:
+    source = source.expanduser().resolve()
+    destination = destination.expanduser().resolve()
+    if not source.is_file():
+        raise WorkflowError(f"Required source file is missing: {source}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.tmp-{os.getpid()}")
+    try:
+        shutil.copy2(source, temporary)
+        temporary.replace(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def parse_time_point(value: str | None) -> int | None:
+    """Parse seconds or HH:MM:SS.mmm/MM:SS.mmm into milliseconds."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        raise WorkflowError("Time value cannot be empty")
+    if re.fullmatch(r"\d+(?:[.,]\d+)?", text):
+        seconds = float(text.replace(",", "."))
+        return round(seconds * 1000)
+    match = TIME_POINT_RE.fullmatch(text)
+    if not match:
+        raise WorkflowError(
+            f"Invalid time {value!r}; use seconds, MM:SS.mmm, or HH:MM:SS.mmm"
+        )
+    fields = match.groupdict()
+    hours = int(fields["hours"] or 0)
+    minutes = int(fields["minutes"])
+    seconds = int(fields["seconds"])
+    if minutes >= 60 and fields["hours"] is not None:
+        raise WorkflowError(f"Invalid minutes in time {value!r}")
+    if seconds >= 60:
+        raise WorkflowError(f"Invalid seconds in time {value!r}")
+    millis_text = (fields["millis"] or "0").ljust(3, "0")
+    return (((hours * 60) + minutes) * 60 + seconds) * 1000 + int(millis_text)
+
+
+def whisper_runtime_python(
+    runtime_root: Path = DEFAULT_WHISPER_RUNTIME_ROOT,
+    explicit: Path | None = None,
+) -> Path:
+    if explicit is not None:
+        return explicit.expanduser().resolve()
+    environment = os.environ.get("SUBFLOW_WHISPER_PYTHON")
+    if environment:
+        return Path(environment).expanduser().resolve()
+    runtime_root = runtime_root.expanduser().resolve()
+    if os.name == "nt":
+        return runtime_root / "venv" / "Scripts" / "python.exe"
+    return runtime_root / "venv" / "bin" / "python"
+
+
+def install_whisper_runtime(runtime_root: Path, *, upgrade: bool = False) -> Path:
+    runtime_root = runtime_root.expanduser().resolve()
+    if not WHISPER_REQUIREMENTS.is_file() or not WHISPER_WORKER.is_file():
+        raise WorkflowError("Whisper runtime support files are missing from the project")
+    python = whisper_runtime_python(runtime_root)
+    if not python.is_file():
+        runtime_root.mkdir(parents=True, exist_ok=True)
+        run([sys.executable, "-m", "venv", str(runtime_root / "venv")])
+    command = [
+        str(python), "-X", "utf8", "-m", "pip", "install",
+        "--disable-pip-version-check",
+    ]
+    if upgrade:
+        command.append("--upgrade")
+    command.extend(["-r", str(WHISPER_REQUIREMENTS)])
+    run(command)
+    return python
 
 
 def manifest_id_for(
@@ -481,6 +589,328 @@ def command_doctor(args: argparse.Namespace) -> int:
     }
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0
+
+
+def command_whisper_doctor(args: argparse.Namespace) -> int:
+    runtime_root = args.runtime_root.expanduser().resolve()
+    model_root = args.model_root.expanduser().resolve()
+    if args.upgrade_runtime and not args.install_runtime:
+        raise WorkflowError("--upgrade-runtime requires --install-runtime")
+    if args.install_runtime:
+        if args.runtime_python is not None:
+            raise WorkflowError("--install-runtime cannot be combined with --runtime-python")
+        python = install_whisper_runtime(runtime_root, upgrade=args.upgrade_runtime)
+    else:
+        python = whisper_runtime_python(runtime_root, args.runtime_python)
+    if not python.is_file():
+        report = {
+            "ok": False,
+            "runtime_root": str(runtime_root),
+            "python": str(python),
+            "model_root": str(model_root),
+            "error": "Whisper runtime is not installed",
+            "hint": "Run 'python subflow.py whisper-doctor --install-runtime'",
+        }
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 2
+    model_root.mkdir(parents=True, exist_ok=True)
+    completed = subprocess.run(
+        [
+            str(python), "-X", "utf8", str(WHISPER_WORKER), "doctor",
+            "--model-root", str(model_root),
+        ],
+        check=False,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if completed.stdout:
+        print(completed.stdout.rstrip())
+    if completed.stderr:
+        print(completed.stderr.rstrip(), file=sys.stderr)
+    return 0 if completed.returncode == 0 else 2
+
+
+def _transcription_metadata_path(output: Path, explicit: Path | None) -> Path:
+    if explicit is not None:
+        return explicit.expanduser().resolve()
+    return output.with_name(f"{output.stem}.transcription.json")
+
+
+def _whisper_worker_command(
+    args: argparse.Namespace,
+    *,
+    python: Path,
+    audio: Path,
+    raw_output: Path,
+    model_root: Path,
+) -> list[str]:
+    command = [
+        str(python), "-X", "utf8", str(WHISPER_WORKER), "transcribe",
+        "--input", str(audio),
+        "--output-json", str(raw_output),
+        "--model-root", str(model_root),
+        "--model", args.model,
+        "--device", args.device,
+        "--compute-type", args.compute_type,
+        "--beam-size", str(args.beam_size),
+    ]
+    if args.language:
+        command.extend(["--language", args.language])
+    if args.vad_filter:
+        command.append("--vad-filter")
+    if args.word_timestamps:
+        command.append("--word-timestamps")
+    if args.no_condition_on_previous_text:
+        command.append("--no-condition-on-previous-text")
+    if args.initial_prompt:
+        command.extend(["--initial-prompt", args.initial_prompt])
+    if args.local_files_only:
+        command.append("--local-files-only")
+    return command
+
+
+def _transcribe_media(
+    args: argparse.Namespace,
+    *,
+    media: Path,
+    start_ms: int | None,
+    end_ms: int | None,
+    selection: dict[str, Any] | None = None,
+) -> int:
+    media = media.expanduser().resolve()
+    if not media.is_file():
+        raise WorkflowError(f"Input media does not exist: {media}")
+    output = args.output.expanduser().resolve()
+    metadata = _transcription_metadata_path(output, args.metadata)
+    runtime_root = args.runtime_root.expanduser().resolve()
+    python = whisper_runtime_python(runtime_root, args.runtime_python)
+    if not python.is_file():
+        raise WorkflowError(
+            f"Whisper runtime is not installed: {python}. "
+            "Run 'python subflow.py whisper-doctor --install-runtime'."
+        )
+    if not WHISPER_WORKER.is_file():
+        raise WorkflowError(f"Whisper worker is missing: {WHISPER_WORKER}")
+    model_root = args.model_root.expanduser().resolve()
+    model_root.mkdir(parents=True, exist_ok=True)
+    if args.beam_size <= 0:
+        raise WorkflowError("--beam-size must be positive")
+    ffmpeg, ffprobe = tool_paths(args.ffmpeg_root)
+    probe = probe_video(ffprobe, media)
+    try:
+        duration_ms = round(float(probe["format"]["duration"]) * 1000)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise WorkflowError(f"Could not determine media duration: {media}") from exc
+    if duration_ms <= 0:
+        raise WorkflowError(f"Media duration is not positive: {media}")
+    range_start = 0 if start_ms is None else start_ms
+    range_end = duration_ms if end_ms is None else end_ms
+    if range_start < 0:
+        raise WorkflowError("Transcription start cannot be negative")
+    if range_start >= duration_ms:
+        raise WorkflowError("Transcription start is outside the media duration")
+    if range_end > duration_ms:
+        if range_end - duration_ms <= 250:
+            range_end = duration_ms
+        else:
+            raise WorkflowError("Transcription end is outside the media duration")
+    if range_end <= range_start:
+        raise WorkflowError("Transcription end must be later than start")
+
+    kept_audio = output.with_name(f"{output.stem}.source.wav") if args.keep_audio else None
+    targets = [output, metadata, *([kept_audio] if kept_audio is not None else [])]
+    if len({str(path).casefold() for path in targets}) != len(targets):
+        raise WorkflowError("SRT, metadata, and preserved audio paths must be different")
+    existing = [path for path in targets if path.exists()]
+    if existing and not args.force:
+        raise WorkflowError(f"Refusing to overwrite existing output: {existing[0]}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    metadata.parent.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory(prefix="subflow-whisper-") as temporary:
+        temp_root = Path(temporary)
+        audio = temp_root / "source-16k-mono.wav"
+        raw_output = temp_root / "worker-result.json"
+        extraction = [
+            str(ffmpeg), "-hide_banner", "-loglevel", "error", "-y",
+            "-i", str(media),
+        ]
+        if range_start:
+            extraction.extend(["-ss", f"{range_start / 1000:.3f}"])
+        if range_start or range_end < duration_ms:
+            extraction.extend(["-t", f"{(range_end - range_start) / 1000:.3f}"])
+        extraction.extend([
+            "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000",
+            "-c:a", "pcm_s16le", str(audio),
+        ])
+        run(extraction)
+        run(_whisper_worker_command(
+            args,
+            python=python,
+            audio=audio,
+            raw_output=raw_output,
+            model_root=model_root,
+        ))
+        worker = json.loads(raw_output.read_text(encoding="utf-8"))
+        if worker.get("schema_version") != SCHEMA_VERSION:
+            raise WorkflowError("Unsupported Whisper worker result schema")
+        raw_segments = worker.get("segments")
+        if not isinstance(raw_segments, list) or not raw_segments:
+            raise WorkflowError("Whisper produced no speech segments")
+
+        cues: list[Cue] = []
+        absolute_segments: list[dict[str, Any]] = []
+        for index, item in enumerate(raw_segments, 1):
+            text = str(item.get("text", "")).strip()
+            if not text:
+                continue
+            segment_start = max(range_start, range_start + round(float(item["start_s"]) * 1000))
+            segment_end = min(range_end, range_start + round(float(item["end_s"]) * 1000))
+            if segment_end <= segment_start:
+                segment_end = min(range_end, segment_start + 1)
+            if segment_end <= segment_start:
+                continue
+            cues.append(Cue(len(cues) + 1, segment_start, segment_end, text))
+            absolute = dict(item)
+            absolute.update({
+                "index": len(cues),
+                "start_ms": segment_start,
+                "end_ms": segment_end,
+            })
+            absolute.pop("start_s", None)
+            absolute.pop("end_s", None)
+            if isinstance(absolute.get("words"), list):
+                adjusted_words = []
+                for word in absolute["words"]:
+                    adjusted = dict(word)
+                    adjusted["start_ms"] = range_start + round(float(word["start_s"]) * 1000)
+                    adjusted["end_ms"] = range_start + round(float(word["end_s"]) * 1000)
+                    adjusted.pop("start_s", None)
+                    adjusted.pop("end_s", None)
+                    adjusted_words.append(adjusted)
+                absolute["words"] = adjusted_words
+            absolute_segments.append(absolute)
+        if not cues:
+            raise WorkflowError("Whisper produced no usable subtitle cues")
+
+        source_sha256 = sha256(media)
+        identity = {
+            "source_sha256": source_sha256,
+            "range_start_ms": range_start,
+            "range_end_ms": range_end,
+            "model": args.model,
+            "language": args.language,
+            "device": args.device,
+            "compute_type": args.compute_type,
+            "beam_size": args.beam_size,
+            "vad_filter": args.vad_filter,
+            "word_timestamps": args.word_timestamps,
+        }
+        transcription_id = hashlib.sha256(
+            json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        if kept_audio is not None:
+            kept_audio.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(audio, kept_audio)
+        staged_srt = output.with_name(f".{output.name}.tmp-{os.getpid()}")
+        try:
+            write_srt(staged_srt, cues)
+            staged_srt.replace(output)
+        finally:
+            staged_srt.unlink(missing_ok=True)
+
+        metadata_payload = {
+            "schema_version": SCHEMA_VERSION,
+            "transcription_id": transcription_id,
+            "created_at": utc_now(),
+            "mode": "range" if (range_start or range_end < duration_ms) else "full",
+            "source": {
+                "media": str(media),
+                "sha256": source_sha256,
+                "duration_ms": duration_ms,
+            },
+            "range": {
+                "start_ms": range_start,
+                "end_ms": range_end,
+                "duration_ms": range_end - range_start,
+            },
+            "selection": selection,
+            "runtime": {
+                "python": str(python),
+                "runtime_root": str(runtime_root),
+                "worker": str(WHISPER_WORKER),
+                "model_root": str(model_root),
+                "ffmpeg": str(ffmpeg),
+                "ffprobe": str(ffprobe),
+            },
+            "model": {
+                "name": args.model,
+                "resolved_path": worker.get("resolved_model"),
+                "was_cached": worker.get("model_was_cached"),
+                "device": args.device,
+                "compute_type": args.compute_type,
+                "requested_language": args.language,
+                "detected_language": worker.get("detected_language"),
+                "language_probability": worker.get("language_probability"),
+            },
+            "options": worker.get("options", {}),
+            "cue_count": len(cues),
+            "segments": absolute_segments,
+            "artifacts": {
+                "srt": str(output),
+                "metadata": str(metadata),
+                "source_audio": None if kept_audio is None else str(kept_audio),
+            },
+        }
+        write_json_atomic(metadata, metadata_payload)
+
+    print(json.dumps({
+        "ok": True,
+        "transcription_id": transcription_id,
+        "cue_count": len(cues),
+        "srt": str(output),
+        "metadata": str(metadata),
+        "range_start_ms": range_start,
+        "range_end_ms": range_end,
+    }, ensure_ascii=False, indent=2))
+    return 0
+
+
+def command_transcribe(args: argparse.Namespace) -> int:
+    return _transcribe_media(
+        args,
+        media=args.media,
+        start_ms=parse_time_point(args.start),
+        end_ms=parse_time_point(args.end),
+    )
+
+
+def command_transcribe_cues(args: argparse.Namespace) -> int:
+    manifest_path = args.manifest.expanduser().resolve()
+    manifest = load_manifest(manifest_path)
+    cue_map = {int(item["index"]): item for item in manifest["cues"]}
+    indexes = parse_cue_selection(args.cues, set(cue_map))
+    if args.padding < 0:
+        raise WorkflowError("--padding cannot be negative")
+    padding_ms = round(args.padding * 1000)
+    start_ms = max(0, min(int(cue_map[index]["start_ms"]) for index in indexes) - padding_ms)
+    end_ms = max(int(cue_map[index]["end_ms"]) for index in indexes) + padding_ms
+    selection = {
+        "manifest": str(manifest_path),
+        "manifest_id": manifest["manifest_id"],
+        "cues": indexes,
+        "padding_ms": padding_ms,
+    }
+    return _transcribe_media(
+        args,
+        media=Path(manifest["source"]["video"]),
+        start_ms=start_ms,
+        end_ms=end_ms,
+        selection=selection,
+    )
 
 
 def command_prepare(args: argparse.Namespace) -> int:
@@ -1262,6 +1692,17 @@ def command_publish(args: argparse.Namespace) -> int:
     copy_optional(manifest_path.parent / "sync_analysis.json", metadata_dir / "sync_analysis.json")
     copy_optional(manifest_path.parent / "evidence" / "packet.json", metadata_dir / "evidence.packet.json")
 
+    source_sidecar: Path | None = None
+    if not args.no_source_sidecar:
+        source_sidecar = subtitle_sidecar_path(
+            Path(manifest["source"]["video"]),
+            target_language,
+        )
+        copy_file_atomic(
+            source_output / f"translated.{target_language}.srt",
+            source_sidecar,
+        )
+
     verification = json.loads((source_output / "verification.json").read_text(encoding="utf-8"))
     run_record = {
         "schema_version": SCHEMA_VERSION,
@@ -1271,6 +1712,10 @@ def command_publish(args: argparse.Namespace) -> int:
         "source_workdir": str(manifest_path.parent),
         "source_output": str(source_output),
         "publish_directory": str(run_dir),
+        "source_sidecar": None if source_sidecar is None else {
+            "path": str(source_sidecar),
+            "sha256": sha256(source_sidecar),
+        },
         "reference_docs": json.loads(decisions_path.read_text(encoding="utf-8")).get("reference_docs", []),
         "verification": {
             "ok": bool(verification.get("ok")),
@@ -1285,11 +1730,14 @@ def command_publish(args: argparse.Namespace) -> int:
         "published_at": run_record["published_at"],
         "manifest_id": manifest["manifest_id"],
         "run_directory": str(run_dir),
+        "source_sidecar": None if source_sidecar is None else str(source_sidecar),
     }
     (output_root / "latest.json").write_text(
         json.dumps(latest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
     print(f"Published: {run_dir}")
+    if source_sidecar is not None:
+        print(f"Source sidecar: {source_sidecar}")
     return 0
 
 
@@ -1337,6 +1785,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
+    def add_whisper_transcription_options(command: argparse.ArgumentParser) -> None:
+        command.add_argument("--output", type=Path, required=True, help="output SRT path")
+        command.add_argument("--metadata", type=Path, help="optional transcription metadata JSON path")
+        command.add_argument("--runtime-root", type=Path, default=DEFAULT_WHISPER_RUNTIME_ROOT)
+        command.add_argument("--runtime-python", type=Path, help="override the isolated runtime Python")
+        command.add_argument("--model-root", type=Path, default=DEFAULT_WHISPER_MODEL_ROOT)
+        command.add_argument("--model", default="large-v3-turbo")
+        command.add_argument("--language", help="ISO-639-1 language code, for example en or ko")
+        command.add_argument("--device", default="cuda", choices=("cuda", "cpu", "auto"))
+        command.add_argument("--compute-type", default="float16")
+        command.add_argument("--beam-size", type=int, default=5)
+        command.add_argument("--vad-filter", action="store_true")
+        command.add_argument("--word-timestamps", action="store_true")
+        command.add_argument("--no-condition-on-previous-text", action="store_true")
+        command.add_argument("--initial-prompt")
+        command.add_argument(
+            "--local-files-only", action="store_true",
+            help="fail instead of downloading a missing model",
+        )
+        command.add_argument("--keep-audio", action="store_true", help="preserve the extracted 16 kHz WAV")
+        command.add_argument("--ffmpeg-root", type=Path)
+        command.add_argument("--force", action="store_true")
+
     doctor = sub.add_parser("doctor", help="check required local tools")
     doctor.add_argument("--ffmpeg-root", type=Path, help="optional explicit FFmpeg root; PATH is searched by default")
     doctor.add_argument(
@@ -1350,6 +1821,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="skip checksum verification (not recommended)",
     )
     doctor.set_defaults(func=command_doctor)
+
+    whisper_doctor = sub.add_parser(
+        "whisper-doctor",
+        help="check or install the project-local faster-whisper runtime",
+    )
+    whisper_doctor.add_argument("--runtime-root", type=Path, default=DEFAULT_WHISPER_RUNTIME_ROOT)
+    whisper_doctor.add_argument("--runtime-python", type=Path)
+    whisper_doctor.add_argument("--model-root", type=Path, default=DEFAULT_WHISPER_MODEL_ROOT)
+    whisper_doctor.add_argument("--install-runtime", action="store_true")
+    whisper_doctor.add_argument("--upgrade-runtime", action="store_true")
+    whisper_doctor.set_defaults(func=command_whisper_doctor)
+
+    transcribe = sub.add_parser(
+        "transcribe",
+        help="transcribe a full media file or an exact time range with faster-whisper",
+    )
+    transcribe.add_argument("media", type=Path)
+    transcribe.add_argument("--start", help="seconds, MM:SS.mmm, or HH:MM:SS.mmm")
+    transcribe.add_argument("--end", help="seconds, MM:SS.mmm, or HH:MM:SS.mmm")
+    add_whisper_transcription_options(transcribe)
+    transcribe.set_defaults(func=command_transcribe)
+
+    transcribe_cues = sub.add_parser(
+        "transcribe-cues",
+        help="retranscribe the time envelope around selected manifest cues",
+    )
+    transcribe_cues.add_argument("--manifest", type=Path, required=True)
+    transcribe_cues.add_argument("--cues", required=True, help="nearby cue indexes, for example 8-12")
+    transcribe_cues.add_argument("--padding", type=float, default=1.25)
+    add_whisper_transcription_options(transcribe_cues)
+    transcribe_cues.set_defaults(func=command_transcribe_cues)
 
     prepare = sub.add_parser("prepare", help="probe media and create review artifacts")
     prepare.add_argument("video", type=Path)
@@ -1429,6 +1931,10 @@ def build_parser() -> argparse.ArgumentParser:
     publish.add_argument("--output-root", type=Path, required=True)
     publish.add_argument("--report", type=Path)
     publish.add_argument("--timestamp", help="optional ISO-8601 timestamp for reproducible/backfilled publishing")
+    publish.add_argument(
+        "--no-source-sidecar", action="store_true",
+        help="do not copy translated.<target>.srt next to the source video as <video>.<target>.srt",
+    )
     publish.set_defaults(func=command_publish)
     return parser
 

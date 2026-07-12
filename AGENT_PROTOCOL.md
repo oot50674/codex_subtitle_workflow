@@ -12,7 +12,23 @@ media, bookkeeping, and rendering layer.
 - `media/frames`: periodic visual context.
 - `evidence/packet.json` plus its WAV/JPG/MP4 files: close audio and moving
   visual evidence for selected cues.
+- `*.transcription.json`: model, source hash, original-timeline range, options,
+  segment confidence, and optional word timestamps for Whisper runs.
 - The two cues before and after every correction candidate.
+
+## Whisper-assisted transcription
+
+1. Run `subflow.py whisper-doctor` before invoking Whisper. Install the
+   project-local runtime or download a missing model only with user approval.
+2. When no draft SRT exists, use `transcribe` on the full media. When checking
+   a doubtful passage, transcribe the smallest useful time range or use
+   `transcribe-cues` on nearby manifest cues.
+3. Treat Whisper output as additional evidence, not as automatic truth. Check
+   surrounding cues and current audio/video before correcting source text.
+4. Partial transcription SRT timestamps are already rebased to the original
+   media timeline. Do not offset them a second time.
+5. Keep `*.transcription.json` with the job evidence so the model, range,
+   options, source hash, and confidence values remain auditable.
 
 ## Document memory and indexing
 
@@ -72,13 +88,16 @@ the new conclusion is stable beyond this one cue.
    document and link only the relevant domain document.
 3. Mark a job `verified` only after `verify` passes. Add its manifest ID and
    timestamped published run after `publish` succeeds.
-4. Promote only reusable terminology, repeated ASR patterns, stable names, and
+4. Confirm that the translated sidecar was written beside the source video as
+   `<video-stem>.<target-language>.srt`, and record that path in the job. Skip
+   it with `--no-source-sidecar` only when explicitly requested.
+5. Promote only reusable terminology, repeated ASR patterns, stable names, and
    continuity decisions into `series` or `domain` documents. Do not copy full
    transcripts, cue-by-cue translations, or temporary guesses into them.
-5. Update `doc/index.json` and `doc/INDEX.md` in the same change. Keep `doc_id`
+6. Update `doc/index.json` and `doc/INDEX.md` in the same change. Keep `doc_id`
    values unique, paths relative to `doc/`, and cross-references resolvable in
    both directions.
-6. Preserve older verified records. Correct them with a dated revision note or
+7. Preserve older verified records. Correct them with a dated revision note or
    mark them superseded; do not silently rewrite history.
 
 ## Decision rules
@@ -132,5 +151,8 @@ the new conclusion is stable beyond this one cue.
   automatic failures.
 - `publish` places the verified deliverables under
   `output/YYYY-MM-DD/HHmmss` and writes a bound `run.json` record.
+- Unless explicitly disabled, `publish` writes the translated subtitle next to
+  the source video as `<video-stem>.<target-language>.srt` and records its path
+  and SHA-256 in `run.json`.
 - A job record exists under `doc/jobs/`, all referenced `doc_id` values resolve
   through `doc/index.json`, and `doc/INDEX.md` reflects the same documents.

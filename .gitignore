@@ -1,3 +1,13 @@
 # Subtitle workflow generated artifacts
 /work/
 /output/
+/.runtime/
+
+# Python bytecode and local environments
+__pycache__/
+*.py[cod]
+
+# Per-job generated documentation
+/doc/jobs/
+/doc/index.json
+/doc/INDEX.md

@@ -52,10 +52,10 @@ updated_at: ""
 - 검증 결과:
 - 경고:
 - 발행 경로:
+- 원본 영상 옆 번역 자막:
 
 ## 인덱스 갱신
 
 - `doc/index.json` 갱신 여부:
 - `doc/INDEX.md` 갱신 여부:
 - 갱신한 series/domain 문서:
-

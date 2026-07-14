@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -1124,6 +1125,7 @@ def command_prepare(args: argparse.Namespace) -> int:
             "media": media,
             "artifacts": {
                 "audio": str(final_audio) if not args.no_audio else None,
+                "audio_sha256": sha256(staged_audio) if not args.no_audio else None,
                 "frames_dir": str(final_frames) if not args.no_frames else None,
                 "frames": [str(final_frames / name) for name in frame_names],
                 "frame_interval_seconds": None if args.no_frames else args.frame_interval,
@@ -1285,104 +1287,1184 @@ def command_evidence(args: argparse.Namespace) -> int:
     return 0
 
 
-def command_sync(args: argparse.Namespace) -> int:
-    """Use FFmpeg audio activity boundaries as evidence, never as an auto-retimer."""
-    manifest_path = args.manifest.resolve()
-    manifest = load_manifest(manifest_path)
+def normalize_intervals_ms(
+    intervals: Iterable[Iterable[int | float] | dict[str, Any]],
+    *,
+    duration_ms: int,
+    join_gap_ms: int = 0,
+) -> list[tuple[int, int]]:
+    """Validate, clip, sort, and union millisecond intervals deterministically."""
+    if duration_ms <= 0:
+        raise WorkflowError("Media duration must be positive")
+    if join_gap_ms < 0:
+        raise WorkflowError("Interval join gap cannot be negative")
+    normalized: list[tuple[int, int]] = []
+    for position, item in enumerate(intervals, 1):
+        if isinstance(item, dict):
+            raw_start = item.get("start_ms")
+            raw_end = item.get("end_ms")
+        else:
+            if isinstance(item, (str, bytes)):
+                raise WorkflowError(f"Interval {position} must not be text")
+            values = list(item)
+            if len(values) != 2:
+                raise WorkflowError(f"Interval {position} must contain exactly two values")
+            raw_start, raw_end = values
+        try:
+            start_value = float(raw_start)
+            end_value = float(raw_end)
+            if not math.isfinite(start_value) or not math.isfinite(end_value):
+                raise ValueError("non-finite boundary")
+            start = round(start_value)
+            end = round(end_value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise WorkflowError(f"Interval {position} contains a non-numeric boundary") from exc
+        if end <= start:
+            raise WorkflowError(f"Interval {position} has a non-positive duration")
+        start = max(0, min(duration_ms, start))
+        end = max(0, min(duration_ms, end))
+        if end > start:
+            normalized.append((start, end))
+
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(normalized):
+        if merged and start <= merged[-1][1] + join_gap_ms:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def complement_intervals_ms(
+    intervals: Iterable[Iterable[int | float] | dict[str, Any]],
+    *,
+    duration_ms: int,
+) -> list[tuple[int, int]]:
+    normalized = normalize_intervals_ms(intervals, duration_ms=duration_ms)
+    complement: list[tuple[int, int]] = []
+    cursor = 0
+    for start, end in normalized:
+        if start > cursor:
+            complement.append((cursor, start))
+        cursor = max(cursor, end)
+    if cursor < duration_ms:
+        complement.append((cursor, duration_ms))
+    return complement
+
+
+def _range_intersections(
+    start_ms: int,
+    end_ms: int,
+    intervals: list[tuple[int, int]],
+) -> list[tuple[int, int, int]]:
+    matches: list[tuple[int, int, int]] = []
+    for interval_index, (start, end) in enumerate(intervals):
+        overlap_start = max(start_ms, start)
+        overlap_end = min(end_ms, end)
+        if overlap_end > overlap_start:
+            matches.append((interval_index, overlap_start, overlap_end))
+    return matches
+
+
+def _subtract_covered_range(
+    start_ms: int,
+    end_ms: int,
+    coverage: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    if end_ms <= start_ms:
+        return []
+    uncovered: list[tuple[int, int]] = []
+    cursor = start_ms
+    for cover_start, cover_end in coverage:
+        if cover_end <= cursor:
+            continue
+        if cover_start >= end_ms:
+            break
+        if cover_start > cursor:
+            uncovered.append((cursor, min(cover_start, end_ms)))
+        cursor = max(cursor, min(cover_end, end_ms))
+        if cursor >= end_ms:
+            break
+    if cursor < end_ms:
+        uncovered.append((cursor, end_ms))
+    return [(start, end) for start, end in uncovered if end > start]
+
+
+def _speech_not_covered_by_subtitles(
+    start_ms: int,
+    end_ms: int,
+    speech: list[tuple[int, int]],
+    subtitle_coverage: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    uncovered: list[tuple[int, int]] = []
+    for _, overlap_start, overlap_end in _range_intersections(start_ms, end_ms, speech):
+        uncovered.extend(_subtract_covered_range(overlap_start, overlap_end, subtitle_coverage))
+    return uncovered
+
+
+def _nearest_boundary(boundaries: Iterable[int], point_ms: int, window_ms: int) -> int | None:
+    candidates = [value for value in boundaries if abs(value - point_ms) <= window_ms]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda value: (abs(value - point_ms), value))
+
+
+def _timing_weight(value_ms: int, threshold_ms: int, *, base: float, maximum: float) -> float:
+    excess_ratio = max(0.0, value_ms / max(threshold_ms, 1) - 1.0)
+    return round(min(maximum, base + excess_ratio * 0.12), 4)
+
+
+def _candidate_score(reasons: list[dict[str, Any]]) -> float:
+    if not reasons:
+        return 0.0
+    families = {
+        "no_detected_speech_overlap": "overlap",
+        "low_speech_overlap": "overlap",
+        "subtitle_starts_before_speech": "contained_silence",
+        "subtitle_ends_after_speech": "contained_silence",
+        "long_internal_silence": "contained_silence",
+        "speech_without_subtitle": "uncovered_speech",
+    }
+    family_weights: dict[str, float] = {}
+    for reason in reasons:
+        family = families.get(str(reason["code"]), str(reason["code"]))
+        family_weights[family] = max(
+            family_weights.get(family, 0.0), float(reason["weight"])
+        )
+    ordered = sorted(family_weights.values(), reverse=True)
+    primary = ordered[0]
+    supporting = min(1.0, sum(ordered[1:]))
+    return round(min(0.99, primary + (1.0 - primary) * 0.15 * supporting), 4)
+
+
+def _severity(score: float) -> str:
+    if score >= 0.75:
+        return "high"
+    if score >= 0.45:
+        return "medium"
+    return "low"
+
+
+def analyze_sync_intervals(
+    cues: Iterable[Cue | dict[str, Any]],
+    speech_intervals_ms: Iterable[Iterable[int | float] | dict[str, Any]],
+    *,
+    media_duration_ms: int,
+    boundary_search_ms: int = 750,
+    review_threshold_ms: int = 450,
+    low_overlap_ratio: float = 0.35,
+    no_overlap_ratio: float = 0.10,
+    utterance_join_gap_ms: int = 120,
+    orphan_speech_min_ms: int = 300,
+) -> dict[str, Any]:
+    """Compare subtitle entries with detected speech without changing any timing."""
+    if boundary_search_ms < 0:
+        raise WorkflowError("Boundary search window cannot be negative")
+    if review_threshold_ms <= 0:
+        raise WorkflowError("Review threshold must be positive")
+    if not 0 <= no_overlap_ratio <= low_overlap_ratio <= 1:
+        raise WorkflowError("Overlap ratios must satisfy 0 <= no <= low <= 1")
+    if orphan_speech_min_ms <= 0:
+        raise WorkflowError("Orphan speech minimum must be positive")
+
+    speech = normalize_intervals_ms(
+        speech_intervals_ms,
+        duration_ms=media_duration_ms,
+    )
+    utterances = normalize_intervals_ms(
+        speech,
+        duration_ms=media_duration_ms,
+        join_gap_ms=utterance_join_gap_ms,
+    )
+    cue_rows: list[dict[str, Any]] = []
+    for item in cues:
+        if isinstance(item, Cue):
+            row = {
+                "index": item.index,
+                "start_ms": item.start_ms,
+                "end_ms": item.end_ms,
+                "source": item.text,
+            }
+        else:
+            row = {
+                "index": int(item["index"]),
+                "start_ms": int(item["start_ms"]),
+                "end_ms": int(item["end_ms"]),
+                "source": str(item.get("source", "")),
+            }
+        if row["start_ms"] < 0 or row["end_ms"] <= row["start_ms"]:
+            raise WorkflowError(f"Cue {row['index']} has invalid timing")
+        if row["end_ms"] > media_duration_ms:
+            raise WorkflowError(f"Cue {row['index']} extends past the media duration")
+        cue_rows.append(row)
+    cue_rows.sort(key=lambda item: (item["start_ms"], item["end_ms"], item["index"]))
+    if len({row["index"] for row in cue_rows}) != len(cue_rows):
+        raise WorkflowError("Cue indexes must be unique")
+
+    subtitle_coverage = normalize_intervals_ms(
+        [(row["start_ms"], row["end_ms"]) for row in cue_rows],
+        duration_ms=media_duration_ms,
+    ) if cue_rows else []
+    cue_position_by_index = {
+        row["index"]: position for position, row in enumerate(cue_rows)
+    }
+    speech_cues: list[list[int]] = []
+    for start, end in speech:
+        speech_cues.append([
+            row["index"] for row in cue_rows
+            if min(end, row["end_ms"]) > max(start, row["start_ms"])
+        ])
+    utterance_cues: list[list[int]] = []
+    for start, end in utterances:
+        utterance_cues.append([
+            row["index"] for row in cue_rows
+            if min(end, row["end_ms"]) > max(start, row["start_ms"])
+        ])
+
+    cue_reports: list[dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
+    relation_counts: dict[str, int] = {}
+
+    for position, row in enumerate(cue_rows):
+        cue_start = row["start_ms"]
+        cue_end = row["end_ms"]
+        cue_duration = cue_end - cue_start
+        overlaps = _range_intersections(cue_start, cue_end, speech)
+        utterance_matches = _range_intersections(cue_start, cue_end, utterances)
+        speech_overlap_ms = sum(end - start for _, start, end in overlaps)
+        overlap_ratio = speech_overlap_ms / cue_duration
+        associated_speech_ms = sum(
+            speech[interval_index][1] - speech[interval_index][0]
+            for interval_index, _, _ in overlaps
+        )
+        speech_coverage_ratio = (
+            speech_overlap_ms / associated_speech_ms if associated_speech_ms else 0.0
+        )
+
+        silence_inside = _subtract_covered_range(cue_start, cue_end, speech)
+        leading_non_speech_ms = (
+            silence_inside[0][1] - silence_inside[0][0]
+            if silence_inside and silence_inside[0][0] == cue_start else 0
+        )
+        trailing_non_speech_ms = (
+            silence_inside[-1][1] - silence_inside[-1][0]
+            if silence_inside and silence_inside[-1][1] == cue_end else 0
+        )
+        largest_internal_silence_ms = max(
+            (end - start for start, end in silence_inside),
+            default=0,
+        )
+        speech_before = _speech_not_covered_by_subtitles(
+            max(0, cue_start - boundary_search_ms),
+            cue_start,
+            speech,
+            subtitle_coverage,
+        )
+        speech_after = _speech_not_covered_by_subtitles(
+            cue_end,
+            min(media_duration_ms, cue_end + boundary_search_ms),
+            speech,
+            subtitle_coverage,
+        )
+        uncovered_speech_before_ms = sum(end - start for start, end in speech_before)
+        uncovered_speech_after_ms = sum(end - start for start, end in speech_after)
+
+        start_boundary_shared = False
+        end_boundary_shared = False
+        nearest_nonoverlap_start = None
+        nearest_nonoverlap_end = None
+        if overlaps:
+            first_speech_index = overlaps[0][0]
+            last_speech_index = overlaps[-1][0]
+            start_boundary_shared = any(
+                cue_position_by_index[cue_index] < position
+                for cue_index in speech_cues[first_speech_index]
+            )
+            end_boundary_shared = any(
+                cue_position_by_index[cue_index] > position
+                for cue_index in speech_cues[last_speech_index]
+            )
+            first_start = speech[first_speech_index][0]
+            last_end = speech[last_speech_index][1]
+            nearest_start = (
+                first_start
+                if not start_boundary_shared
+                and abs(first_start - cue_start) <= boundary_search_ms
+                else None
+            )
+            nearest_end = (
+                last_end
+                if not end_boundary_shared
+                and abs(last_end - cue_end) <= boundary_search_ms
+                else None
+            )
+            boundary_match_kind = (
+                "associated_interval_boundary"
+                if nearest_start is not None or nearest_end is not None
+                else "associated_interval_context_only"
+            )
+        else:
+            nearest_start = None
+            nearest_end = None
+            if speech:
+                nearest_interval = min(
+                    speech,
+                    key=lambda interval: (
+                        cue_start - interval[1]
+                        if interval[1] <= cue_start
+                        else interval[0] - cue_end,
+                        interval[0],
+                        interval[1],
+                    ),
+                )
+                interval_distance = (
+                    cue_start - nearest_interval[1]
+                    if nearest_interval[1] <= cue_start
+                    else nearest_interval[0] - cue_end
+                )
+                if 0 <= interval_distance <= boundary_search_ms:
+                    nearest_nonoverlap_start, nearest_nonoverlap_end = nearest_interval
+            boundary_match_kind = (
+                "nearest_nonoverlap_interval_context"
+                if nearest_nonoverlap_start is not None else "none"
+            )
+        start_offset = None if nearest_start is None else cue_start - nearest_start
+        end_offset = None if nearest_end is None else cue_end - nearest_end
+
+        utterance_indexes = [index for index, _, _ in utterance_matches]
+        related_cues = sorted({
+            cue_index
+            for utterance_index in utterance_indexes
+            for cue_index in utterance_cues[utterance_index]
+        })
+        if not utterance_indexes:
+            relation = "no_detected_speech"
+        elif len(utterance_indexes) == 1 and len(utterance_cues[utterance_indexes[0]]) == 1:
+            relation = "one_speech_one_cue"
+        elif len(utterance_indexes) == 1:
+            relation = "one_speech_many_cues"
+        elif all(len(utterance_cues[index]) == 1 for index in utterance_indexes):
+            relation = "many_speech_one_cue"
+        else:
+            relation = "many_speech_many_cues"
+        relation_counts[relation] = relation_counts.get(relation, 0) + 1
+
+        reasons: list[dict[str, Any]] = []
+        if overlap_ratio < no_overlap_ratio:
+            reasons.append({
+                "code": "no_detected_speech_overlap",
+                "weight": 0.88,
+                "value": round(overlap_ratio, 4),
+                "threshold": no_overlap_ratio,
+            })
+        elif overlap_ratio < low_overlap_ratio:
+            shortfall = (low_overlap_ratio - overlap_ratio) / max(low_overlap_ratio, 0.001)
+            reasons.append({
+                "code": "low_speech_overlap",
+                "weight": round(min(0.62, 0.32 + shortfall * 0.30), 4),
+                "value": round(overlap_ratio, 4),
+                "threshold": low_overlap_ratio,
+            })
+        meaningful_overlap = overlap_ratio >= no_overlap_ratio
+        if meaningful_overlap and leading_non_speech_ms >= review_threshold_ms:
+            reasons.append({
+                "code": "subtitle_starts_before_speech",
+                "weight": _timing_weight(
+                    leading_non_speech_ms, review_threshold_ms, base=0.34, maximum=0.62,
+                ),
+                "value_ms": leading_non_speech_ms,
+                "threshold_ms": review_threshold_ms,
+            })
+        if meaningful_overlap and trailing_non_speech_ms >= review_threshold_ms:
+            reasons.append({
+                "code": "subtitle_ends_after_speech",
+                "weight": _timing_weight(
+                    trailing_non_speech_ms, review_threshold_ms, base=0.34, maximum=0.62,
+                ),
+                "value_ms": trailing_non_speech_ms,
+                "threshold_ms": review_threshold_ms,
+            })
+        internal_silence_threshold = max(900, review_threshold_ms * 2)
+        if (
+            meaningful_overlap
+            and
+            largest_internal_silence_ms >= internal_silence_threshold
+            and leading_non_speech_ms < largest_internal_silence_ms
+            and trailing_non_speech_ms < largest_internal_silence_ms
+        ):
+            internal_silence_ratio = largest_internal_silence_ms / cue_duration
+            internal_weight = _timing_weight(
+                largest_internal_silence_ms,
+                internal_silence_threshold,
+                base=0.22,
+                maximum=0.42,
+            )
+            if largest_internal_silence_ms >= 3000 or internal_silence_ratio >= 0.50:
+                internal_weight = max(internal_weight, 0.48)
+            reasons.append({
+                "code": "long_internal_silence",
+                "weight": round(internal_weight, 4),
+                "value_ms": largest_internal_silence_ms,
+                "value_ratio": round(internal_silence_ratio, 4),
+                "threshold_ms": internal_silence_threshold,
+            })
+
+        score = _candidate_score(reasons)
+        score_adjustments: list[dict[str, Any]] = []
+        if relation == "no_detected_speech" and cue_duration <= 1500 and score >= 0.75:
+            score_adjustments.append({
+                "code": "short_cue_vad_false_negative_risk",
+                "original_score": score,
+                "maximum_score": 0.74,
+            })
+            score = 0.74
+        neighbor_indexes = [
+            cue_rows[index]["index"]
+            for index in range(max(0, position - 1), min(len(cue_rows), position + 2))
+            if index != position
+        ]
+        review_cue_indexes = [
+            cue_rows[index]["index"]
+            for index in range(max(0, position - 2), min(len(cue_rows), position + 3))
+        ]
+        flags: list[str] = []
+        reason_codes = {reason["code"] for reason in reasons}
+        if reasons:
+            flags.append("timing_review")
+        if "no_detected_speech_overlap" in reason_codes:
+            flags.append("no_detected_activity_overlap")
+        if reason_codes & {
+            "subtitle_starts_before_speech",
+        }:
+            flags.append("start_timing_review")
+        if reason_codes & {
+            "subtitle_ends_after_speech",
+        }:
+            flags.append("end_timing_review")
+        if relation in {"one_speech_many_cues", "many_speech_many_cues"}:
+            flags.append("shared_utterance_group")
+        if relation in {"many_speech_one_cue", "many_speech_many_cues"}:
+            flags.append("multiple_utterances_in_cue")
+
+        cue_report = {
+            "index": row["index"],
+            "source": row["source"],
+            "subtitle_start_ms": cue_start,
+            "subtitle_end_ms": cue_end,
+            "subtitle_duration_ms": cue_duration,
+            "detected_activity_start_ms": nearest_start,
+            "detected_activity_end_ms": nearest_end,
+            "start_offset_ms": start_offset,
+            "end_offset_ms": end_offset,
+            "boundary_match_kind": boundary_match_kind,
+            "nearest_nonoverlap_interval_start_ms": nearest_nonoverlap_start,
+            "nearest_nonoverlap_interval_end_ms": nearest_nonoverlap_end,
+            "offset_sign_convention": (
+                "subtitle boundary minus detected speech boundary; positive means subtitle is later"
+            ),
+            "detected_activity_overlap_ratio": round(overlap_ratio, 4),
+            "vad_speech_overlap_ms": speech_overlap_ms,
+            "vad_speech_overlap_ratio": round(overlap_ratio, 4),
+            "associated_speech_coverage_ratio": round(speech_coverage_ratio, 4),
+            "leading_non_speech_ms": leading_non_speech_ms,
+            "trailing_non_speech_ms": trailing_non_speech_ms,
+            "largest_internal_silence_ms": largest_internal_silence_ms,
+            "uncovered_speech_before_ms": uncovered_speech_before_ms,
+            "uncovered_speech_after_ms": uncovered_speech_after_ms,
+            "matched_speech_interval_indexes": [index + 1 for index, _, _ in overlaps],
+            "matched_utterance_indexes": [index + 1 for index in utterance_indexes],
+            "relation": relation,
+            "related_cue_indexes": related_cues or [row["index"]],
+            "neighbor_indexes": neighbor_indexes,
+            "review_cue_indexes": review_cue_indexes,
+            "start_boundary_evidence": nearest_start is not None,
+            "end_boundary_evidence": nearest_end is not None,
+            "start_boundary_shared_with_previous_cue": start_boundary_shared,
+            "end_boundary_shared_with_next_cue": end_boundary_shared,
+            "candidate_score": score,
+            "candidate_reasons": reasons,
+            "score_adjustments": score_adjustments,
+            "flags": flags,
+        }
+        cue_reports.append(cue_report)
+        if reasons:
+            candidates.append({
+                "candidate_id": f"cue:{row['index']}",
+                "type": "cue_timing",
+                "anchor_cue_index": row["index"],
+                "cue_indexes": [row["index"]],
+                "related_cue_indexes": related_cues or [row["index"]],
+                "review_cue_indexes": review_cue_indexes,
+                "start_ms": max(0, cue_start - boundary_search_ms),
+                "end_ms": min(media_duration_ms, cue_end + boundary_search_ms),
+                "relation": relation,
+                "score": score,
+                "severity": _severity(score),
+                "reasons": reasons,
+                "score_adjustments": score_adjustments,
+                "suggested_action": (
+                    "check_timing_or_vad_false_negative"
+                    if relation == "no_detected_speech"
+                    else "inspect_audio_video_with_neighbor_cues"
+                ),
+                "automatic_timing_change_allowed": False,
+            })
+
+    cue_candidates = candidates
+    candidates = [item for item in cue_candidates if item["score"] >= 0.45]
+    secondary_candidates = [item for item in cue_candidates if item["score"] < 0.45]
+
+    uncovered_speech: list[tuple[int, int]] = []
+    for speech_start, speech_end in speech:
+        uncovered_speech.extend(
+            _subtract_covered_range(speech_start, speech_end, subtitle_coverage)
+        )
+    uncovered_fragments = [
+        (start, end) for start, end in uncovered_speech
+        if end - start >= orphan_speech_min_ms
+    ]
+
+    def interval_context(start: int, end: int) -> tuple[list[int], list[int]]:
+        before = [row for row in cue_rows if row["end_ms"] <= start]
+        after = [row for row in cue_rows if row["start_ms"] >= end]
+        left = max(before, key=lambda row: (row["end_ms"], row["index"])) if before else None
+        right = min(after, key=lambda row: (row["start_ms"], row["index"])) if after else None
+        anchors = [row["index"] for row in (left, right) if row is not None]
+        review_positions: set[int] = set()
+        for cue_index in anchors:
+            position = cue_position_by_index[cue_index]
+            review_positions.update(range(max(0, position - 2), min(len(cue_rows), position + 3)))
+        review_cues = [cue_rows[position]["index"] for position in sorted(review_positions)]
+        return anchors, review_cues
+
+    orphan_utterances: list[tuple[int, int, int, int]] = []
+    for utterance_index, (start, end) in enumerate(utterances):
+        if utterance_cues[utterance_index]:
+            continue
+        speech_duration = sum(
+            overlap_end - overlap_start
+            for _, overlap_start, overlap_end in _range_intersections(start, end, speech)
+        )
+        if speech_duration >= orphan_speech_min_ms:
+            orphan_utterances.append((utterance_index, start, end, speech_duration))
+
+    for utterance_index, start, end, speech_duration in orphan_utterances:
+        anchors, review_cues = interval_context(start, end)
+        if speech_duration < 600:
+            weight = 0.44
+        elif speech_duration < 1000:
+            weight = 0.62
+        else:
+            weight = min(0.90, 0.82 + (speech_duration - 1000) / 10000)
+        reasons = [{
+            "code": "speech_without_subtitle",
+            "weight": round(weight, 4),
+            "value_ms": speech_duration,
+            "threshold_ms": orphan_speech_min_ms,
+        }]
+        score = _candidate_score(reasons)
+        candidates.append({
+            "candidate_id": f"speech-without-cue:{utterance_index + 1}",
+            "type": "speech_without_subtitle",
+            "anchor_cue_index": None,
+            "cue_indexes": anchors,
+            "related_cue_indexes": anchors,
+            "review_cue_indexes": review_cues,
+            "start_ms": start,
+            "end_ms": end,
+            "relation": "speech_without_cue",
+            "score": score,
+            "severity": _severity(score),
+            "reasons": reasons,
+            "suggested_action": "inspect_for_missing_or_shifted_subtitle",
+            "automatic_timing_change_allowed": False,
+        })
+
+    for fragment_index, (start, end) in enumerate(uncovered_fragments, 1):
+        parent_indexes = [
+            index for index, (utterance_start, utterance_end) in enumerate(utterances)
+            if min(end, utterance_end) > max(start, utterance_start)
+        ]
+        if parent_indexes and all(not utterance_cues[index] for index in parent_indexes):
+            continue
+        anchors, review_cues = interval_context(start, end)
+        related = sorted({
+            cue_index
+            for parent_index in parent_indexes
+            for cue_index in utterance_cues[parent_index]
+        })
+        duration = end - start
+        parent_speech_duration = sum(
+            overlap_end - overlap_start
+            for parent_index in parent_indexes
+            for _, overlap_start, overlap_end in _range_intersections(
+                utterances[parent_index][0], utterances[parent_index][1], speech
+            )
+        )
+        fragment_ratio = duration / max(parent_speech_duration, 1)
+        is_significant_fragment = duration >= 1000 or fragment_ratio >= 0.50
+        reason_code = (
+            "large_uncovered_fragment_in_captioned_utterance"
+            if is_significant_fragment else "shared_utterance_uncovered_fragment"
+        )
+        weight = (
+            min(0.82, 0.52 + max(0, duration - 1000) / 10000)
+            if is_significant_fragment
+            else min(0.35, 0.20 + duration / 10000)
+        )
+        reasons = [{
+            "code": reason_code,
+            "weight": round(weight, 4),
+            "value_ms": duration,
+            "value_ratio": round(fragment_ratio, 4),
+            "threshold_ms": orphan_speech_min_ms,
+        }]
+        score = _candidate_score(reasons)
+        fragment_candidate = {
+            "candidate_id": f"shared-fragment:{fragment_index}",
+            "type": (
+                "possible_missing_or_shifted_subtitle"
+                if is_significant_fragment else "shared_utterance_uncovered_fragment"
+            ),
+            "anchor_cue_index": None,
+            "cue_indexes": anchors,
+            "related_cue_indexes": related or anchors,
+            "review_cue_indexes": review_cues,
+            "start_ms": start,
+            "end_ms": end,
+            "relation": "utterance_already_has_subtitle",
+            "score": score,
+            "severity": _severity(score),
+            "reasons": reasons,
+            "suggested_action": (
+                "inspect_for_missing_or_shifted_subtitle"
+                if is_significant_fragment
+                else "review_only_if_primary_candidate_nearby"
+            ),
+            "automatic_timing_change_allowed": False,
+        }
+        if is_significant_fragment:
+            candidates.append(fragment_candidate)
+        else:
+            secondary_candidates.append(fragment_candidate)
+
+    boundaries: list[dict[str, Any]] = []
+    for left, right in zip(cue_rows, cue_rows[1:]):
+        gap_start = left["end_ms"]
+        gap_end = right["start_ms"]
+        speech_in_gap_ms = 0
+        if gap_end > gap_start:
+            speech_in_gap_ms = sum(
+                end - start
+                for _, start, end in _range_intersections(gap_start, gap_end, speech)
+            )
+        shared_utterances = [
+            index for index, cue_indexes in enumerate(utterance_cues)
+            if left["index"] in cue_indexes and right["index"] in cue_indexes
+        ]
+        boundary_flags: list[str] = []
+        if speech_in_gap_ms >= orphan_speech_min_ms:
+            boundary_flags.append("speech_in_subtitle_gap")
+        if gap_end < gap_start:
+            boundary_flags.append("subtitle_overlap")
+        if shared_utterances:
+            boundary_flags.append("boundary_inside_shared_utterance")
+        boundaries.append({
+            "left_cue_index": left["index"],
+            "right_cue_index": right["index"],
+            "subtitle_gap_ms": gap_end - gap_start,
+            "speech_in_positive_gap_ms": speech_in_gap_ms,
+            "shared_utterance_indexes": [index + 1 for index in shared_utterances],
+            "flags": boundary_flags,
+        })
+
+    utterance_groups = [
+        {
+            "index": index + 1,
+            "start_ms": start,
+            "end_ms": end,
+            "cue_indexes": utterance_cues[index],
+            "relation": (
+                "speech_without_cue" if not utterance_cues[index]
+                else "one_speech_one_cue" if len(utterance_cues[index]) == 1
+                else "one_speech_many_cues"
+            ),
+            "automatic_boundary_snap_allowed": False,
+        }
+        for index, (start, end) in enumerate(utterances)
+    ]
+    candidates.sort(key=lambda item: (-item["score"], item["start_ms"], item["candidate_id"]))
+    secondary_candidates.sort(
+        key=lambda item: (-item["score"], item["start_ms"], item["candidate_id"])
+    )
+    severity_counts = {"high": 0, "medium": 0, "low": 0}
+    for candidate in candidates:
+        severity_counts[candidate["severity"]] += 1
+    secondary_severity_counts = {"high": 0, "medium": 0, "low": 0}
+    for candidate in secondary_candidates:
+        secondary_severity_counts[candidate["severity"]] += 1
+    cue_with_any_reason_count = sum(
+        bool(item["candidate_reasons"]) for item in cue_reports
+    )
+    primary_cue_candidate_count = sum(
+        item["type"] == "cue_timing" for item in candidates
+    )
+    secondary_cue_candidate_count = sum(
+        item["type"] == "cue_timing" for item in secondary_candidates
+    )
+    orphan_intervals = [
+        [start, end] for _, start, end, _ in orphan_utterances
+    ]
+
+    return {
+        "comparison_parameters": {
+            "boundary_search_ms": boundary_search_ms,
+            "review_threshold_ms": review_threshold_ms,
+            "low_overlap_ratio": low_overlap_ratio,
+            "no_overlap_ratio": no_overlap_ratio,
+            "utterance_join_gap_ms": utterance_join_gap_ms,
+            "orphan_speech_min_ms": orphan_speech_min_ms,
+            "score_method": "maximum reason plus at most 15 percent residual support",
+            "primary_cue_candidate_minimum_score": 0.45,
+        },
+        "speech_intervals_ms": [[start, end] for start, end in speech],
+        "utterance_groups": utterance_groups,
+        "silence_intervals_ms": [
+            [start, end]
+            for start, end in complement_intervals_ms(speech, duration_ms=media_duration_ms)
+        ],
+        "orphan_utterance_intervals_ms": orphan_intervals,
+        "uncovered_speech_intervals_ms": orphan_intervals,
+        "uncovered_speech_fragments_ms": [list(item) for item in uncovered_fragments],
+        "compatibility_aliases": {
+            "uncovered_speech_intervals_ms": "orphan_utterance_intervals_ms",
+        },
+        "cues": cue_reports,
+        "boundaries": boundaries,
+        "candidates": candidates,
+        "secondary_candidates": secondary_candidates,
+        "summary": {
+            "cue_count": len(cue_reports),
+            "cue_with_any_reason_count": cue_with_any_reason_count,
+            "primary_cue_candidate_count": primary_cue_candidate_count,
+            "secondary_cue_candidate_count": secondary_cue_candidate_count,
+            "flagged_cue_count": cue_with_any_reason_count,
+            "primary_flagged_cue_count": primary_cue_candidate_count,
+            "candidate_count": len(candidates),
+            "secondary_candidate_count": len(secondary_candidates),
+            "candidate_severity_counts": severity_counts,
+            "secondary_candidate_severity_counts": secondary_severity_counts,
+            "uncovered_speech_interval_count": len(orphan_utterances),
+            "uncovered_speech_fragment_count": len(uncovered_fragments),
+            "relation_counts": relation_counts,
+        },
+    }
+
+
+def _ffmpeg_activity_intervals(
+    manifest: dict[str, Any],
+    *,
+    noise: str,
+    min_silence: float,
+    duration_ms: int,
+) -> tuple[list[tuple[int, int]], dict[str, Any]]:
     video = Path(manifest["source"]["video"])
     ffmpeg = Path(manifest["tools"]["ffmpeg"])
-    duration_s = float(manifest["media"]["format"]["duration"])
     completed = run([
         str(ffmpeg), "-hide_banner", "-nostats", "-i", str(video),
         "-map", "0:a:0",
-        "-af", f"silencedetect=n={args.noise}:d={args.min_silence:g}",
+        "-af", f"silencedetect=n={noise}:d={min_silence:g}",
         "-f", "null", "-",
     ], capture=True)
     events = re.findall(r"silence_(start|end):\s*([0-9.]+)", completed.stderr)
-    silences: list[tuple[float, float]] = []
-    pending: float | None = None
+    silences: list[tuple[int, int]] = []
+    pending: int | None = None
     for event, value in events:
-        at = float(value)
+        at = round(float(value) * 1000)
         if event == "start":
             pending = at
         elif pending is not None:
-            silences.append((pending, at))
+            if at > pending:
+                silences.append((pending, at))
             pending = None
-        else:
-            silences.append((0.0, at))
-    if pending is not None:
-        silences.append((pending, duration_s))
+        elif at > 0:
+            silences.append((0, at))
+    if pending is not None and duration_ms > pending:
+        silences.append((pending, duration_ms))
+    activity = complement_intervals_ms(silences, duration_ms=duration_ms)
+    detector = {
+        "kind": "ffmpeg-silencedetect",
+        "implementation": "FFmpeg silencedetect complement",
+        "ffmpeg": str(ffmpeg),
+        "parameters": {
+            "noise": noise,
+            "minimum_silence_seconds": min_silence,
+        },
+        "warning": (
+            "This backend detects non-silence, not speech. Music and noise may be activity."
+        ),
+    }
+    return activity, detector
 
-    speech: list[tuple[float, float]] = []
-    cursor = 0.0
-    for start, end in sorted(silences):
-        if start > cursor:
-            speech.append((cursor, start))
-        cursor = max(cursor, end)
-    if cursor < duration_s:
-        speech.append((cursor, duration_s))
 
-    analysis = []
-    for cue in manifest["cues"]:
-        start_s = cue["start_ms"] / 1000
-        end_s = cue["end_ms"] / 1000
-        overlaps = [max(0.0, min(end_s, b) - max(start_s, a)) for a, b in speech]
-        speech_overlap_s = sum(overlaps)
-        overlap_ratio = speech_overlap_s / max(end_s - start_s, 0.001)
-        start_candidates = [a for a, _ in speech if abs(a - start_s) <= args.search_window]
-        end_candidates = [b for _, b in speech if abs(b - end_s) <= args.search_window]
-        flags = []
-        speech_start = min(start_candidates, key=lambda value: abs(value - start_s)) if start_candidates else None
-        speech_end = min(end_candidates, key=lambda value: abs(value - end_s)) if end_candidates else None
-        if speech_start is not None:
-            start_offset = round((start_s - speech_start) * 1000)
-            if abs(start_offset) >= args.review_threshold_ms:
-                flags.append("start_timing_review")
-        else:
-            start_offset = None
-        if speech_end is not None:
-            end_offset = round((end_s - speech_end) * 1000)
-            if abs(end_offset) >= args.review_threshold_ms:
-                flags.append("end_timing_review")
-        else:
-            end_offset = None
+def _legacy_activity_cue_analysis(
+    cues: Iterable[dict[str, Any]],
+    activity: list[tuple[int, int]],
+    *,
+    search_window_ms: int,
+    review_threshold_ms: int,
+) -> list[dict[str, Any]]:
+    """Preserve the schema and non-speech semantics of the original FFmpeg sync report."""
+    analysis: list[dict[str, Any]] = []
+    for cue in cues:
+        start_ms = int(cue["start_ms"])
+        end_ms = int(cue["end_ms"])
+        overlaps = _range_intersections(start_ms, end_ms, activity)
+        overlap_ms = sum(end - start for _, start, end in overlaps)
+        overlap_ratio = overlap_ms / max(end_ms - start_ms, 1)
+        activity_start = _nearest_boundary(
+            (start for start, _ in activity), start_ms, search_window_ms,
+        )
+        activity_end = _nearest_boundary(
+            (end for _, end in activity), end_ms, search_window_ms,
+        )
+        start_offset = None if activity_start is None else start_ms - activity_start
+        end_offset = None if activity_end is None else end_ms - activity_end
+        flags: list[str] = []
+        if start_offset is not None and abs(start_offset) >= review_threshold_ms:
+            flags.append("start_timing_review")
+        if end_offset is not None and abs(end_offset) >= review_threshold_ms:
+            flags.append("end_timing_review")
         if overlap_ratio < 0.10:
             flags.append("no_detected_activity_overlap")
         analysis.append({
-            "index": cue["index"],
-            "subtitle_start_ms": cue["start_ms"],
-            "subtitle_end_ms": cue["end_ms"],
-            "detected_activity_start_ms": None if speech_start is None else round(speech_start * 1000),
-            "detected_activity_end_ms": None if speech_end is None else round(speech_end * 1000),
+            "index": int(cue["index"]),
+            "subtitle_start_ms": start_ms,
+            "subtitle_end_ms": end_ms,
+            "detected_activity_start_ms": activity_start,
+            "detected_activity_end_ms": activity_end,
             "start_offset_ms": start_offset,
             "end_offset_ms": end_offset,
             "detected_activity_overlap_ratio": round(overlap_ratio, 4),
-            "start_boundary_evidence": speech_start is not None,
-            "end_boundary_evidence": speech_end is not None,
+            "start_boundary_evidence": activity_start is not None,
+            "end_boundary_evidence": activity_end is not None,
             "flags": flags,
         })
+    return analysis
+
+
+def _silero_vad_intervals(
+    manifest: dict[str, Any],
+    args: argparse.Namespace,
+    *,
+    duration_ms: int,
+    temporary_root: Path,
+) -> tuple[list[tuple[int, int]], dict[str, Any]]:
+    runtime_root = args.runtime_root.expanduser().resolve()
+    python = whisper_runtime_python(runtime_root, args.runtime_python)
+    if not python.is_file():
+        raise WorkflowError(
+            f"Whisper runtime is not installed: {python}. "
+            "Run 'python subflow.py whisper-doctor --install-runtime' only after download approval."
+        )
+    if not WHISPER_WORKER.is_file():
+        raise WorkflowError(f"Whisper worker is missing: {WHISPER_WORKER}")
+
+    artifacts = manifest.get("artifacts", {})
+    prepared_audio_value = artifacts.get("audio")
+    prepared_audio_sha256 = artifacts.get("audio_sha256")
+    prepared_audio = Path(prepared_audio_value) if prepared_audio_value else None
+    retained_audio = (
+        prepared_audio is not None
+        and prepared_audio.is_file()
+        and isinstance(prepared_audio_sha256, str)
+        and bool(prepared_audio_sha256)
+    )
+    if retained_audio:
+        audio = prepared_audio.resolve()
+        actual_audio_sha256 = sha256(audio)
+        if actual_audio_sha256 != prepared_audio_sha256:
+            raise WorkflowError(f"Prepared audio changed after prepare: {audio}")
+        expected_audio_sha256 = actual_audio_sha256
+    else:
+        audio = temporary_root / "audio_16k_mono.wav"
+        ffmpeg = Path(manifest["tools"]["ffmpeg"])
+        run([
+            str(ffmpeg), "-hide_banner", "-loglevel", "error", "-y",
+            "-i", str(Path(manifest["source"]["video"])),
+            "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000",
+            "-c:a", "pcm_s16le", str(audio),
+        ])
+        expected_audio_sha256 = sha256(audio)
+
+    worker_output = temporary_root / "silero-vad-result.json"
+    command = [
+        str(python), "-X", "utf8", str(WHISPER_WORKER), "vad",
+        "--input", str(audio),
+        "--output-json", str(worker_output),
+        "--threshold", str(args.vad_threshold),
+        "--neg-threshold", str(args.vad_neg_threshold),
+        "--min-speech-ms", str(args.vad_min_speech_ms),
+        "--min-silence-ms", str(args.vad_min_silence_ms),
+        "--speech-pad-ms", str(args.vad_speech_pad_ms),
+    ]
+    if args.vad_max_speech_seconds is not None:
+        command.extend(["--max-speech-seconds", str(args.vad_max_speech_seconds)])
+    run(command)
+    worker = json.loads(worker_output.read_text(encoding="utf-8"))
+    if worker.get("schema_version") != SCHEMA_VERSION:
+        raise WorkflowError("Unsupported Silero VAD worker result schema")
+    worker_input = worker.get("input") or {}
+    try:
+        worker_input_path = Path(str(worker_input["path"])).resolve()
+    except (KeyError, OSError, ValueError) as exc:
+        raise WorkflowError("Silero VAD worker returned an invalid input path") from exc
+    if str(worker_input_path).casefold() != str(audio.resolve()).casefold():
+        raise WorkflowError("Silero VAD worker analyzed an unexpected audio path")
+    if worker_input.get("sha256") != expected_audio_sha256:
+        raise WorkflowError("Silero VAD worker audio hash does not match the submitted audio")
+    if int(worker_input.get("sampling_rate_hz", 0)) != 16000:
+        raise WorkflowError("Silero VAD worker did not analyze 16 kHz audio")
+    worker_detector = worker.get("detector") or {}
+    if worker_detector.get("kind") != "silero-vad":
+        raise WorkflowError("Silero VAD worker returned the wrong detector kind")
+    worker_parameters = worker.get("parameters") or {}
+    expected_parameters = {
+        "threshold": args.vad_threshold,
+        "neg_threshold": args.vad_neg_threshold,
+        "min_speech_duration_ms": args.vad_min_speech_ms,
+        "min_silence_duration_ms": args.vad_min_silence_ms,
+        "speech_pad_ms": args.vad_speech_pad_ms,
+        "max_speech_duration_s": args.vad_max_speech_seconds,
+    }
+    for key, expected_value in expected_parameters.items():
+        actual_value = worker_parameters.get(key)
+        if isinstance(expected_value, float):
+            if actual_value is None or not math.isclose(
+                float(actual_value), expected_value, rel_tol=0.0, abs_tol=1e-9,
+            ):
+                raise WorkflowError(f"Silero VAD worker parameter mismatch: {key}")
+        elif actual_value != expected_value:
+            raise WorkflowError(f"Silero VAD worker parameter mismatch: {key}")
+    raw_intervals = worker.get("speech_intervals_ms")
+    if not isinstance(raw_intervals, list):
+        raise WorkflowError("Silero VAD worker did not return speech intervals")
+    worker_duration = int(worker.get("input", {}).get("duration_ms", 0))
+    duration_delta_ms = duration_ms - worker_duration
+    allowed_truncated_tail_ms = int(
+        getattr(args, "allow_truncated_audio_tail_ms", 0) or 0
+    )
+    last_cue_end_ms = max(
+        (int(cue["end_ms"]) for cue in manifest.get("cues", [])),
+        default=0,
+    )
+    truncated_tail_accepted = (
+        retained_audio
+        and duration_delta_ms > 1000
+        and duration_delta_ms <= allowed_truncated_tail_ms
+        and last_cue_end_ms <= worker_duration
+    )
+    if abs(duration_delta_ms) > 1000 and not truncated_tail_accepted:
+        raise WorkflowError(
+            f"VAD audio duration differs from manifest by more than 1 second: "
+            f"{worker_duration} ms vs {duration_ms} ms"
+        )
+    intervals = normalize_intervals_ms(raw_intervals, duration_ms=duration_ms)
+    detector = dict(worker_detector)
+    detector.update({
+        "runtime_python": str(python),
+        "runtime_root": str(runtime_root),
+        "input_audio": worker.get("input"),
+        "input_audio_retained": retained_audio,
+        "input_audio_manifest_hash_verified": retained_audio,
+        "prepared_audio_ignored_without_manifest_hash": (
+            prepared_audio is not None and prepared_audio.is_file() and not prepared_audio_sha256
+        ),
+        "truncated_audio_tail": {
+            "accepted": truncated_tail_accepted,
+            "allowed_ms": allowed_truncated_tail_ms,
+            "actual_missing_ms": max(0, duration_delta_ms),
+            "last_cue_end_ms": last_cue_end_ms,
+        },
+        "parameters": worker.get("parameters"),
+    })
+    return intervals, detector
+
+
+def command_sync(args: argparse.Namespace) -> int:
+    """Create advisory speech-to-subtitle timing candidates; never auto-retime."""
+    manifest_path = args.manifest.resolve()
+    manifest = load_manifest(manifest_path)
+    try:
+        duration_seconds = float(manifest["media"]["format"]["duration"])
+        if not math.isfinite(duration_seconds):
+            raise ValueError("non-finite duration")
+        duration_ms = round(duration_seconds * 1000)
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        raise WorkflowError("Manifest does not contain a valid media duration") from exc
+    if duration_ms <= 0:
+        raise WorkflowError("Media duration must be positive")
+
+    output = args.output.resolve()
+    protected_values = [
+        manifest_path,
+        Path(manifest["source"]["video"]),
+        Path(manifest["source"]["subtitle"]),
+    ]
+    prepared_audio_value = manifest.get("artifacts", {}).get("audio")
+    if prepared_audio_value:
+        protected_values.append(Path(prepared_audio_value))
+    protected = {str(path.expanduser().resolve()).casefold() for path in protected_values}
+    if str(output).casefold() in protected:
+        raise WorkflowError("Sync report output must not overwrite a manifest or source artifact")
+    if output.exists():
+        if output.is_dir():
+            raise WorkflowError(f"Sync report output is a directory: {output}")
+        if not args.force:
+            raise WorkflowError(f"Refusing to overwrite existing sync report: {output}")
+        try:
+            previous_report = json.loads(output.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise WorkflowError(
+                "--force may replace only an existing sync report bound to this manifest"
+            ) from exc
+        allowed_methods = {
+            "FFmpeg silencedetect audio-activity heuristic",
+            "Silero VAD v5 speech-to-subtitle timing audit",
+        }
+        backend_methods = {
+            "ffmpeg": "FFmpeg silencedetect audio-activity heuristic",
+            "silero": "Silero VAD v5 speech-to-subtitle timing audit",
+        }
+        if (
+            not isinstance(previous_report, dict)
+            or previous_report.get("manifest_id") != manifest["manifest_id"]
+            or previous_report.get("method") not in allowed_methods
+            or previous_report.get("sync_schema_version") not in {1, 2}
+            or previous_report.get("advisory_only") is not True
+            or previous_report.get("timing_changes_applied") is not False
+            or backend_methods.get(previous_report.get("backend"))
+            != previous_report.get("method")
+            or not isinstance(previous_report.get("cues"), list)
+        ):
+            raise WorkflowError(
+                "--force may replace only an existing sync report bound to this manifest"
+            )
+
+    if args.backend == "ffmpeg":
+        activity, detector = _ffmpeg_activity_intervals(
+            manifest,
+            noise=args.noise,
+            min_silence=args.min_silence,
+            duration_ms=duration_ms,
+        )
+        cue_analysis = _legacy_activity_cue_analysis(
+            manifest["cues"],
+            activity,
+            search_window_ms=round(args.search_window * 1000),
+            review_threshold_ms=args.review_threshold_ms,
+        )
+        report = {
+            "schema_version": SCHEMA_VERSION,
+            "sync_schema_version": 1,
+            "created_at": utc_now(),
+            "manifest": str(manifest_path),
+            "manifest_id": manifest["manifest_id"],
+            "backend": "ffmpeg",
+            "method": "FFmpeg silencedetect audio-activity heuristic",
+            "warning": (
+                "Activity is the complement of detected silence, not speech recognition. "
+                "Background music/noise can resemble speech. Agent review is required."
+            ),
+            "advisory_only": True,
+            "timing_changes_applied": False,
+            "detector": detector,
+            "parameters": {
+                "noise": args.noise,
+                "minimum_silence_seconds": args.min_silence,
+                "search_window_seconds": args.search_window,
+                "review_threshold_ms": args.review_threshold_ms,
+            },
+            "silence_intervals_ms": [
+                list(item)
+                for item in complement_intervals_ms(activity, duration_ms=duration_ms)
+            ],
+            "activity_intervals_ms": [list(item) for item in activity],
+            "cues": cue_analysis,
+        }
+        write_json_atomic(output, report)
+        flagged = sum(bool(item["flags"]) for item in cue_analysis)
+        print(f"Sync evidence (ffmpeg): {output} ({flagged}/{len(cue_analysis)} cues flagged)")
+        return 0
+
+    with tempfile.TemporaryDirectory(prefix="subflow-sync-") as temporary:
+        temporary_root = Path(temporary)
+        detected, detector = _silero_vad_intervals(
+            manifest,
+            args,
+            duration_ms=duration_ms,
+            temporary_root=temporary_root,
+        )
+        method = "Silero VAD v5 speech-to-subtitle timing audit"
+        warning = (
+            "Silero VAD estimates likely speech regions; it does not know subtitle meaning or "
+            "the correct cue boundary. Candidates require audio/video and neighbor-cue review."
+        )
+
+        analysis = analyze_sync_intervals(
+            manifest["cues"],
+            detected,
+            media_duration_ms=duration_ms,
+            boundary_search_ms=round(args.search_window * 1000),
+            review_threshold_ms=args.review_threshold_ms,
+            low_overlap_ratio=args.low_overlap_ratio,
+            no_overlap_ratio=args.no_overlap_ratio,
+            utterance_join_gap_ms=args.utterance_join_gap_ms,
+            orphan_speech_min_ms=args.orphan_speech_min_ms,
+        )
+
     report = {
         "schema_version": SCHEMA_VERSION,
+        "sync_schema_version": 2,
         "created_at": utc_now(),
         "manifest": str(manifest_path),
         "manifest_id": manifest["manifest_id"],
-        "method": "FFmpeg silencedetect audio-activity heuristic",
-        "warning": "Activity is the complement of detected silence, not speech recognition. Background music/noise can resemble speech. Agent review is required before timing changes.",
-        "parameters": {
-            "noise": args.noise,
-            "minimum_silence_seconds": args.min_silence,
-            "search_window_seconds": args.search_window,
-            "review_threshold_ms": args.review_threshold_ms,
+        "source": {
+            "video": manifest["source"]["video"],
+            "video_sha256": manifest["source"]["video_sha256"],
+            "subtitle": manifest["source"]["subtitle"],
+            "subtitle_sha256": manifest["source"]["subtitle_sha256"],
+            "media_duration_ms": duration_ms,
         },
-        "silence_intervals_ms": [[round(a * 1000), round(b * 1000)] for a, b in silences],
-        "activity_intervals_ms": [[round(a * 1000), round(b * 1000)] for a, b in speech],
-        "cues": analysis,
+        "backend": args.backend,
+        "method": method,
+        "warning": warning,
+        "advisory_only": True,
+        "timing_changes_applied": False,
+        "detector": detector,
+        "parameters": {
+            "backend": args.backend,
+            "detection": detector.get("parameters", {}),
+            "comparison": analysis["comparison_parameters"],
+        },
+        "activity_intervals_ms": analysis["speech_intervals_ms"],
+        "activity_intervals_ms_alias_of": "speech_intervals_ms",
+        "candidate_tiers": {
+            "primary": "ranked review queue",
+            "secondary": "low-score or already-captioned utterance context",
+        },
+        **analysis,
     }
-    output = args.output.resolve()
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    flagged = sum(bool(item["flags"]) for item in analysis)
-    print(f"Sync evidence: {output} ({flagged}/{len(analysis)} cues flagged)")
+    write_json_atomic(output, report)
+    primary_cues = report["summary"]["primary_cue_candidate_count"]
+    total = report["summary"]["cue_count"]
+    candidate_count = report["summary"]["candidate_count"]
+    secondary_count = report["summary"]["secondary_candidate_count"]
+    print(
+        f"Sync evidence ({args.backend}): {output} "
+        f"({primary_cues}/{total} primary cue candidates, {candidate_count} primary and "
+        f"{secondary_count} secondary candidates)"
+    )
     return 0
 
 
@@ -1413,12 +2495,6 @@ def command_merge(args: argparse.Namespace) -> int:
                 raise WorkflowError(f"{path} references unknown cue {index}")
             if index in merged and not replace_existing:
                 raise WorkflowError(f"Cue {index} occurs in both {origins[index]} and {path}")
-            expected_source = re.sub(r"\s+", " ", source_cues[index]["source"]).strip()
-            supplied_source = re.sub(r"\s+", " ", str(item.get("source", ""))).strip()
-            if not supplied_source and not replace_existing:
-                raise WorkflowError(f"Cue {index} in {path} is missing its source evidence")
-            if supplied_source and supplied_source != expected_source:
-                raise WorkflowError(f"Source mismatch for cue {index} in {path}")
             normalized = dict(merged[index]) if index in merged and replace_existing else {}
             normalized.update(item)
             normalized["index"] = index
@@ -1507,17 +2583,6 @@ def command_merge(args: argparse.Namespace) -> int:
 def load_decisions(path: Path, manifest: dict[str, Any], manifest_path: Path) -> dict[int, dict[str, Any]]:
     path = path.resolve()
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if payload.get("schema_version") != SCHEMA_VERSION:
-        raise WorkflowError(f"Unsupported decisions schema: {payload.get('schema_version')}")
-    if payload.get("manifest_id") != manifest["manifest_id"]:
-        raise WorkflowError(f"Decisions belong to a different manifest: {path}")
-    decision_manifest = payload.get("manifest")
-    if not decision_manifest or Path(decision_manifest).resolve() != manifest_path.resolve():
-        raise WorkflowError(f"Decisions reference a different manifest path: {path}")
-    if payload.get("source_language") != manifest["source_language"]:
-        raise WorkflowError("Decision source language does not match the manifest")
-    if payload.get("target_language") != manifest["target_language"]:
-        raise WorkflowError("Decision target language does not match the manifest")
     expected = {int(item["index"]): item for item in manifest["cues"]}
     result: dict[int, dict[str, Any]] = {}
     for item in payload.get("decisions", []):
@@ -1526,8 +2591,6 @@ def load_decisions(path: Path, manifest: dict[str, Any], manifest_path: Path) ->
             raise WorkflowError(f"Duplicate decision for cue {index}")
         if index not in expected:
             raise WorkflowError(f"Decision references unknown cue {index}")
-        if "source" not in item or str(item["source"]) != str(expected[index]["source"]):
-            raise WorkflowError(f"Decision source mismatch at cue {index}")
         result[index] = item
     return result
 
@@ -1774,6 +2837,17 @@ def command_publish(args: argparse.Namespace) -> int:
     empty_translations = [index for index, item in decisions.items() if not str(item.get("translation") or "").strip()]
     if empty_translations:
         raise WorkflowError(f"Publish requires complete translations; empty cues: {empty_translations[:10]}")
+    changes_path = source_output / "changes.json"
+    try:
+        changes = json.loads(changes_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise WorkflowError(f"Publish requires a valid apply record: {changes_path}") from exc
+    if not isinstance(changes, dict):
+        raise WorkflowError(f"Publish apply record must be an object: {changes_path}")
+    if changes.get("schema_version") != SCHEMA_VERSION:
+        raise WorkflowError(f"Publish apply record has an unsupported schema: {changes_path}")
+    if changes.get("manifest_id") != manifest["manifest_id"]:
+        raise WorkflowError("Rendered subtitles belong to a different manifest")
     if command_verify(argparse.Namespace(manifest=manifest_path, output=source_output)) != 0:
         raise WorkflowError("Refusing to publish because verification failed")
 
@@ -2053,18 +3127,47 @@ def build_parser() -> argparse.ArgumentParser:
     evidence.add_argument("--context", type=int, default=2)
     evidence.set_defaults(func=command_evidence)
 
-    sync = sub.add_parser("sync", help="create speech/silence timing evidence for agent review")
+    sync = sub.add_parser(
+        "sync",
+        help="compare subtitle entries with FFmpeg activity or Silero VAD speech evidence",
+    )
     sync.add_argument("--manifest", type=Path, required=True)
     sync.add_argument("--output", type=Path, required=True)
+    sync.add_argument(
+        "--backend", choices=("ffmpeg", "silero"), default="ffmpeg",
+        help="keep legacy FFmpeg activity analysis or opt into Silero speech detection",
+    )
     sync.add_argument("--noise", default="-25dB")
     sync.add_argument("--min-silence", type=float, default=0.25)
     sync.add_argument("--search-window", type=float, default=0.75)
     sync.add_argument("--review-threshold-ms", type=int, default=450)
+    sync.add_argument("--low-overlap-ratio", type=float, default=0.35)
+    sync.add_argument("--no-overlap-ratio", type=float, default=0.10)
+    sync.add_argument("--utterance-join-gap-ms", type=int, default=120)
+    sync.add_argument("--orphan-speech-min-ms", type=int, default=300)
+    sync.add_argument("--runtime-root", type=Path, default=DEFAULT_WHISPER_RUNTIME_ROOT)
+    sync.add_argument("--runtime-python", type=Path)
+    sync.add_argument("--vad-threshold", type=float, default=0.50)
+    sync.add_argument("--vad-neg-threshold", type=float, default=0.35)
+    sync.add_argument("--vad-min-speech-ms", type=int, default=100)
+    sync.add_argument("--vad-min-silence-ms", type=int, default=250)
+    sync.add_argument("--vad-speech-pad-ms", type=int, default=100)
+    sync.add_argument("--vad-max-speech-seconds", type=float)
+    sync.add_argument(
+        "--allow-truncated-audio-tail-ms",
+        type=int,
+        default=0,
+        help=(
+            "accept a shorter hash-bound prepared WAV only when every cue ends before "
+            "the WAV; intended for a damaged or silent media tail"
+        ),
+    )
+    sync.add_argument("--force", action="store_true", help="replace an existing report file")
     sync.set_defaults(func=command_sync)
 
     merge = sub.add_parser("merge", help="merge agent decision JSON parts")
     merge.add_argument("--manifest", type=Path, required=True)
-    merge.add_argument("--parts", type=Path, nargs="*", help="decision JSON parts with explicit source evidence")
+    merge.add_argument("--parts", type=Path, nargs="*", help="decision JSON parts")
     merge.add_argument("--translation-map", type=Path, nargs="*", help="compact JSON maps of cue index to translation")
     merge.add_argument("--overrides", type=Path, nargs="*", help="review files applied after parts; later values win")
     merge.add_argument(

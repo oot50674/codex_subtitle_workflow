@@ -25,9 +25,33 @@
   disables manual and automatic subtitle downloads.
 - Keep media operations deterministic in the CLI. The agent owns semantic
   correction, translation, timing judgment, and evidence notes.
-- Use `subflow.py transcribe` for a missing full draft or an exact time range.
-  Use `transcribe-cues` for nearby manifest cues that need an ASR cross-check.
-  Partial SRT timestamps are restored to the original media timeline.
+- Submit every full or partial Whisper transcription through
+  `scripts/retranscription_queue.ps1`; do not launch overlapping direct
+  `subflow.py transcribe` processes. Enqueue focused cue evidence with
+  `-JobType transcribe-cues -Manifest <path> -Cues <selection>` rather than
+  invoking it directly. Partial SRT timestamps are restored to the original
+  media timeline. After an interrupted worker, use `-Action recover` only after
+  confirming no worker is active.
+- For a multi-file batch, jobs may be enqueued in advance, but drain one initial
+  full-file job at a time with `-Action drain -MaxJobs 1`. After each job
+  completes, run `prepare`, then translate and review that file before draining
+  the next job unless the user requests a different order.
+- After each file's full transcription and `prepare`, run
+  `scripts/silero_sync_audit.ps1` when timing review is in scope. It shares the
+  global media-worker lock with the transcription queue, creates candidates
+  only, and must never rewrite cue timings. It is not a prerequisite for
+  translation.
+- Keep Silero media-duration matching strict. Use
+  `-AllowTruncatedAudioTailMs` only for a SHA-256-bound prepared WAV whose
+  missing tail begins after the final cue, and document the damaged media tail.
+- After approved explicit timing overrides, create a comparison artifact with
+  `scripts/finalize_sync_subtitles.ps1`. Its default display padding is 300 ms
+  before and 800 ms after each approved override, configurable up to 3000 ms.
+  It proportionally reduces padding in short gaps, never moves untargeted
+  cues, refuses double padding, and runs `apply` plus `verify` before exposing
+  the new output directory.
+- Keep only reusable, job-independent utilities under `scripts/`. Put scripts
+  written for one current video, series, or batch under `temp/`.
 - Store each job in a new work directory and publish final artifacts under
   `output/YYYY-MM-DD/HHmmss`.
 - By default, `publish` also writes the translated subtitle beside the source

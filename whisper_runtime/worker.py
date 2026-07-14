@@ -9,6 +9,7 @@ and exchanges deterministic JSON artifacts with the parent CLI.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.metadata
 import json
 import os
@@ -34,6 +35,14 @@ def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
         encoding="utf-8",
     )
     temporary.replace(path)
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def cached_model_files(model_root: Path) -> list[str]:
@@ -108,6 +117,27 @@ def command_doctor(args: argparse.Namespace) -> int:
             "ctranslate2": importlib.metadata.version("ctranslate2"),
             "cuda_device_count": ctranslate2.get_cuda_device_count(),
         })
+        try:
+            import onnxruntime
+            from faster_whisper.utils import get_assets_path
+
+            assets = Path(get_assets_path())
+            encoder = assets / "silero_encoder_v5.onnx"
+            decoder = assets / "silero_decoder_v5.onnx"
+            vad_ready = encoder.is_file() and decoder.is_file()
+            report["onnxruntime"] = onnxruntime.__version__
+            report["silero_vad"] = {
+                "available": vad_ready,
+                "model": "silero-vad-v5-onnx",
+                "encoder": str(encoder.resolve()),
+                "decoder": str(decoder.resolve()),
+                "error": None if vad_ready else "Bundled Silero VAD v5 ONNX assets are missing",
+            }
+        except Exception as vad_exc:
+            report["silero_vad"] = {
+                "available": False,
+                "error": f"{type(vad_exc).__name__}: {vad_exc}",
+            }
     except Exception as exc:  # diagnostic command must return structured detail
         report["error"] = f"{type(exc).__name__}: {exc}"
     print(json.dumps(report, ensure_ascii=False, indent=2))
@@ -224,6 +254,109 @@ def command_transcribe(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_vad(args: argparse.Namespace) -> int:
+    """Run the faster-whisper bundled Silero VAD without loading Whisper."""
+    source = args.input.expanduser().resolve()
+    output = args.output_json.expanduser().resolve()
+    if not source.is_file():
+        raise FileNotFoundError(f"Input audio does not exist: {source}")
+    if output == source:
+        raise ValueError("VAD output JSON must not overwrite its input audio")
+    if output.exists():
+        raise FileExistsError(f"Refusing to overwrite existing VAD output: {output}")
+    if not 0.0 < args.threshold < 1.0:
+        raise ValueError("--threshold must be between 0 and 1")
+    if args.neg_threshold is not None:
+        if not 0.0 < args.neg_threshold < args.threshold:
+            raise ValueError("--neg-threshold must be positive and lower than --threshold")
+    if args.min_speech_ms < 0:
+        raise ValueError("--min-speech-ms cannot be negative")
+    if args.min_silence_ms < 0:
+        raise ValueError("--min-silence-ms cannot be negative")
+    if args.speech_pad_ms < 0:
+        raise ValueError("--speech-pad-ms cannot be negative")
+    if args.max_speech_seconds is not None and args.max_speech_seconds <= 0:
+        raise ValueError("--max-speech-seconds must be positive")
+
+    import numpy as np
+    import onnxruntime
+    from faster_whisper.audio import decode_audio
+    from faster_whisper.utils import get_assets_path
+    from faster_whisper.vad import VadOptions, get_speech_timestamps
+
+    assets = Path(get_assets_path())
+    encoder = (assets / "silero_encoder_v5.onnx").resolve()
+    decoder = (assets / "silero_decoder_v5.onnx").resolve()
+    if not encoder.is_file() or not decoder.is_file():
+        raise FileNotFoundError("Bundled Silero VAD v5 ONNX assets are missing")
+
+    sampling_rate = 16000
+    audio = decode_audio(str(source), sampling_rate=sampling_rate)
+    if not isinstance(audio, np.ndarray) or audio.ndim != 1:
+        raise RuntimeError("Silero VAD expected one mono audio channel")
+    duration_ms = round(len(audio) * 1000 / sampling_rate)
+    options = VadOptions(
+        threshold=args.threshold,
+        neg_threshold=args.neg_threshold,
+        min_speech_duration_ms=args.min_speech_ms,
+        max_speech_duration_s=(
+            float("inf") if args.max_speech_seconds is None else args.max_speech_seconds
+        ),
+        min_silence_duration_ms=args.min_silence_ms,
+        speech_pad_ms=args.speech_pad_ms,
+    )
+    timestamps = get_speech_timestamps(
+        audio,
+        vad_options=options,
+        sampling_rate=sampling_rate,
+    )
+    intervals = [
+        [
+            round(int(item["start"]) * 1000 / sampling_rate),
+            round(int(item["end"]) * 1000 / sampling_rate),
+        ]
+        for item in timestamps
+    ]
+
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "created_at": utc_now(),
+        "input": {
+            "path": str(source),
+            "sha256": sha256(source),
+            "sampling_rate_hz": sampling_rate,
+            "sample_count": len(audio),
+            "duration_ms": duration_ms,
+        },
+        "detector": {
+            "kind": "silero-vad",
+            "implementation": "faster-whisper.vad",
+            "model": "silero-vad-v5-onnx",
+            "faster_whisper_version": importlib.metadata.version("faster-whisper"),
+            "onnxruntime_version": onnxruntime.__version__,
+            "numpy_version": np.__version__,
+            "assets": {
+                "encoder": {"path": str(encoder), "sha256": sha256(encoder)},
+                "decoder": {"path": str(decoder), "sha256": sha256(decoder)},
+            },
+        },
+        "parameters": {
+            "threshold": args.threshold,
+            "neg_threshold": args.neg_threshold,
+            "min_speech_duration_ms": args.min_speech_ms,
+            "min_silence_duration_ms": args.min_silence_ms,
+            "speech_pad_ms": args.speech_pad_ms,
+            "max_speech_duration_s": args.max_speech_seconds,
+        },
+        "speech_intervals_ms": intervals,
+        "speech_interval_count": len(intervals),
+        "speech_duration_ms": sum(end - start for start, end in intervals),
+    }
+    write_json_atomic(output, payload)
+    print(str(output))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="subflow-whisper-worker")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -247,6 +380,17 @@ def build_parser() -> argparse.ArgumentParser:
     transcribe.add_argument("--initial-prompt")
     transcribe.add_argument("--local-files-only", action="store_true")
     transcribe.set_defaults(func=command_transcribe)
+
+    vad = sub.add_parser("vad")
+    vad.add_argument("--input", type=Path, required=True)
+    vad.add_argument("--output-json", type=Path, required=True)
+    vad.add_argument("--threshold", type=float, default=0.5)
+    vad.add_argument("--neg-threshold", type=float)
+    vad.add_argument("--min-speech-ms", type=int, default=100)
+    vad.add_argument("--min-silence-ms", type=int, default=250)
+    vad.add_argument("--speech-pad-ms", type=int, default=100)
+    vad.add_argument("--max-speech-seconds", type=float)
+    vad.set_defaults(func=command_vad)
     return parser
 
 

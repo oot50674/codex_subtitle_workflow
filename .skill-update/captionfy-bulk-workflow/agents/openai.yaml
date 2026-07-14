@@ -1,0 +1,4 @@
+interface:
+  display_name: "Captionfy Bulk Workflow"
+  short_description: "Bulk subtitle upload and playlist management"
+  default_prompt: "Use $captionfy-bulk-workflow to upload subtitle files through the local bridge API and organize them in Captionfy."

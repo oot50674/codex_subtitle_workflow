@@ -1,6 +1,7 @@
 # Subtitle workflow generated artifacts
 /work/
 /output/
+/temp/
 /.runtime/
 
 # Python bytecode and local environments
@@ -9,5 +10,7 @@ __pycache__/
 
 # Per-job generated documentation
 /doc/jobs/
+/doc/domains/
+/doc/series/
 /doc/index.json
 /doc/INDEX.md
